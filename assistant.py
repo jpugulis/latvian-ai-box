@@ -6,6 +6,9 @@ import glob
 import webbrowser
 import requests
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
