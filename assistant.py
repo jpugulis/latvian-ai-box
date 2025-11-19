@@ -311,41 +311,51 @@ def get_youtube_url_by_id(item_id: str) -> str | None:
 
 
 def play_youtube_item(item_id: str):
-    """Open a configured YouTube item in Google Chrome in the background.
+    """Open a configured YouTube item in the default web browser.
 
-    Izmanto macOS komandu 'open -g -a "Google Chrome" <url>', lai Chrome
-    atvērtos fonā un Terminālis paliktu aktīvs.
+    Uz Windows un macOS izmanto standarta pārlūku (parasti Chrome vai Edge).
+    Terminālis paliek aktīvs, jo webbrowser.open neatbloķē programmu.
     """
     url = get_youtube_url_by_id(item_id)
     if not url:
         print(f"[*] Neatradu YouTube ierakstu ar ID: {item_id}")
         return
-    print(f"-> Atveru YouTube Chrome pārlūkā (fonā): {url}")
+    print(f"-> Atveru YouTube pārlūkā: {url}")
     try:
-        subprocess.run(["open", "-g", "-a", "Google Chrome", url], check=False)
+        # webbrowser.open darbojas gan uz macOS, gan uz Windows
+        webbrowser.open(url, new=1)
     except Exception as e:
-        print(f"[*] Neizdevās atvērt Google Chrome: {e}")
+        print(f"[*] Neizdevās atvērt pārlūku: {e}")
 
 
 def stop_youtube_playback():
-    """Try to stop YouTube playback by closing Google Chrome windows on macOS.
+    """Try to stop YouTube playback by closing browser windows.
 
-    Šī ir vienkārša pieeja, kas paredzēta speciālai ierīces lietošanai – tiek
-    aizvērtI visi Chrome logi, tādēļ Chrome nedrīkst būt nepieciešams citām
-    lietām vienlaikus.
+    macOS: izmanto AppleScript, lai aizvērtu Google Chrome logus.
+    Windows: mēģina aizvērt Chrome un Edge procesus ar taskkill.
+    Šī ir radikāla pieeja, paredzēta speciālai ierīcei, kur pārlūks
+    netiek izmantots citām lietām vienlaikus.
     """
     try:
-        subprocess.run(
-            [
-                "osascript",
-                "-e",
-                'tell application "Google Chrome" to close windows',
-            ],
-            check=False,
-        )
-        print("[*] Mēģinu aizvērt Google Chrome logus.")
+        if sys.platform == "darwin":
+            subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    'tell application "Google Chrome" to close windows',
+                ],
+                check=False,
+            )
+            print("[*] Mēģinu aizvērt Google Chrome logus (macOS).")
+        elif sys.platform.startswith("win"):
+            # Mēģinām aizvērt Chrome un Edge, ja tie atskaņo YouTube
+            subprocess.run(["taskkill", "/IM", "chrome.exe", "/F"], check=False)
+            subprocess.run(["taskkill", "/IM", "msedge.exe", "/F"], check=False)
+            print("[*] Mēģinu aizvērt Chrome/Edge logus (Windows).")
+        else:
+            print("[*] Pārlūka aizvēršana šajā platformā nav implementēta.")
     except Exception as e:
-        print(f"[*] Neizdevās aizvērt Google Chrome: {e}")
+        print(f"[*] Neizdevās aizvērt pārlūku: {e}")
 
 
 def play_audio_file(path: str):
