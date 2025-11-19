@@ -62,7 +62,11 @@ YOUTUBE_ITEMS = {
 DEFAULT_WEATHER_PLACE = "Vecpiebalga, Latvia"
 # ==================
 
-client = OpenAI()
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise RuntimeError("OPENAI_API_KEY is not set. Check your .env file on this machine.")
+
+client = OpenAI(api_key=api_key)
 
 
 def record_audio_to_wav(path: str):
