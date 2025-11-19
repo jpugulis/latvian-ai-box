@@ -311,21 +311,38 @@ def get_youtube_url_by_id(item_id: str) -> str | None:
 
 
 def play_youtube_item(item_id: str):
-    """Open a configured YouTube item in the default web browser.
-
-    Uz Windows un macOS izmanto standarta pārlūku (parasti Chrome vai Edge).
-    Terminālis paliek aktīvs, jo webbrowser.open neatbloķē programmu.
+    """Open a configured YouTube item in the default browser with autoplay and
+    return focus to the PowerShell window on Windows.
     """
     url = get_youtube_url_by_id(item_id)
     if not url:
         print(f"[*] Neatradu YouTube ierakstu ar ID: {item_id}")
         return
+
+    # Add autoplay parameter
+    if "?" in url:
+        url = url + "&autoplay=1"
+    else:
+        url = url + "?autoplay=1"
+
     print(f"-> Atveru YouTube pārlūkā: {url}")
+
     try:
-        # webbrowser.open darbojas gan uz macOS, gan uz Windows
         webbrowser.open(url, new=1)
     except Exception as e:
         print(f"[*] Neizdevās atvērt pārlūku: {e}")
+        return
+
+    # Return focus to PowerShell on Windows
+    if sys.platform.startswith("win"):
+        try:
+            subprocess.run([
+                "powershell",
+                "-command",
+                "(New-Object -ComObject WScript.Shell).AppActivate((Get-Process -Id $PID).MainWindowTitle)"
+            ], check=False)
+        except Exception:
+            pass
 
 
 def stop_youtube_playback():
