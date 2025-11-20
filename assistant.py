@@ -5,6 +5,8 @@ import subprocess
 import glob
 import webbrowser
 import requests
+import threading
+import time
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -19,14 +21,6 @@ import sys
 if sys.platform.startswith("win"):
     import keyboard
 
-# --- TAPO smart home imports ---
-from ha_client import (
-    get_current_temperature,
-    get_current_humidity,
-    get_leak_status,
-    get_pellet_level,
-    get_full_state
-)
 
 # ===== CONFIG =====
 SAMPLE_RATE = 16_000
@@ -442,6 +436,45 @@ def play_audio_file(path: str):
     sd.wait()
 
 
+# ===== THINKING SOUND HELPERS =====
+THINKING_SOUND_FREQ = 1200
+THINKING_SOUND_DURATION = 0.03
+THINKING_SOUND_INTERVAL = 0.15
+thinking_stop_event = threading.Event()
+thinking_thread = None
+
+def _thinking_sound_loop():
+    tone_sr = SAMPLE_RATE
+    while not thinking_stop_event.is_set():
+        # Generate a very short noise burst with fast decay, like a soft tick
+        t = np.linspace(0, THINKING_SOUND_DURATION, int(tone_sr * THINKING_SOUND_DURATION), False)
+        noise = np.random.uniform(-1.0, 1.0, size=t.shape)
+        envelope = np.exp(-t * 60.0)  # very fast decay for clicky feel
+        tone = (0.12 * noise * envelope).astype(np.float32)
+
+        sd.play(tone, tone_sr)
+        sd.wait()
+
+        slept = 0.0
+        chunk = 0.02
+        while slept < THINKING_SOUND_INTERVAL:
+            if thinking_stop_event.is_set():
+                break
+            time.sleep(min(chunk, THINKING_SOUND_INTERVAL - slept))
+            slept += chunk
+
+def start_thinking_sound():
+    global thinking_thread
+    if thinking_thread is not None and thinking_thread.is_alive():
+        return
+    thinking_stop_event.clear()
+    thinking_thread = threading.Thread(target=_thinking_sound_loop, daemon=True)
+    thinking_thread.start()
+
+def stop_thinking_sound():
+    thinking_stop_event.set()
+
+
 def main_loop():
     print("=== Latviešu balss asistents (prototips) ===")
     print("Ctrl+C, lai izietu.\n")
@@ -472,80 +505,11 @@ def main_loop():
                     play_audio_file(out_path)
                     continue
 
-                # ----- TAPO SMART HOME INTENTS -----
-                lt = lower_text
-
-                # Druviņas temperature
-                if "temperatūr" in lt or "cik silts" in lt:
-                    try:
-                        temp = get_current_temperature()
-                        if temp is None:
-                            msg = "Neizdodas nolasīt temperatūru Druviņās."
-                        else:
-                            msg = f"Druviņās tagad ir apmēram {temp:.1f} grādi."
-                        tts_latvian_to_file(msg, out_path)
-                        play_audio_file(out_path)
-                        continue
-                    except Exception:
-                        msg = "Radās kļūda mēģinot nolasīt temperatūru Druviņās."
-                        tts_latvian_to_file(msg, out_path)
-                        play_audio_file(out_path)
-                        continue
-
-                # Druviņas humidity
-                if "mitrum" in lt:
-                    try:
-                        hum = get_current_humidity()
-                        if hum is None:
-                            msg = "Neizdodas nolasīt mitrumu Druviņās."
-                        else:
-                            msg = f"Druviņās mitrums ir ap {hum:.0f} procentiem."
-                        tts_latvian_to_file(msg, out_path)
-                        play_audio_file(out_path)
-                        continue
-                    except Exception:
-                        msg = "Kļūda nolasot mitrumu Druviņās."
-                        tts_latvian_to_file(msg, out_path)
-                        play_audio_file(out_path)
-                        continue
-
-                # Leak detection
-                if "noplūd" in lt or "ūdens" in lt:
-                    try:
-                        leak = get_leak_status()
-                        if leak:
-                            msg = "Tiek ziņots par ūdens noplūdi Druviņās."
-                        else:
-                            msg = "Viss ir kārtībā. Noplūdes nav konstatētas."
-                        tts_latvian_to_file(msg, out_path)
-                        play_audio_file(out_path)
-                        continue
-                    except Exception:
-                        msg = "Neizdevās iegūt informāciju par noplūdēm."
-                        tts_latvian_to_file(msg, out_path)
-                        play_audio_file(out_path)
-                        continue
-
-                # Pellet level (door sensor hack)
-                if "granul" in lt or "tvertn" in lt or "līmen" in lt:
-                    try:
-                        pellet_ok = get_pellet_level()
-                        if pellet_ok is None:
-                            msg = "Neizdodas nolasīt granulu līmeņa sensoru."
-                        elif pellet_ok:
-                            msg = "Granulu līmenis izskatās labs."
-                        else:
-                            msg = "Granulu līmenis ir zems. Vajadzēs papildināt."
-                        tts_latvian_to_file(msg, out_path)
-                        play_audio_file(out_path)
-                        continue
-                    except Exception:
-                        msg = "Neizdevās nolasīt informāciju par granulu līmeni."
-                        tts_latvian_to_file(msg, out_path)
-                        play_audio_file(out_path)
-                        continue
-
-                reply_text = chat_latvian_elderly(text)
+                start_thinking_sound()
+                try:
+                    reply_text = chat_latvian_elderly(text)
+                finally:
+                    stop_thinking_sound()
 
                 # Ja modelis atgriež komandu atskaņot audiogrāmatu,
                 # izsaucam lokālo atskaņotāju un nelasām TTS atbildi.
