@@ -14,7 +14,19 @@ import sounddevice as sd
 import soundfile as sf
 from openai import OpenAI
 
-import keyboard
+
+import sys
+if sys.platform.startswith("win"):
+    import keyboard
+
+# --- TAPO smart home imports ---
+from ha_client import (
+    get_current_temperature,
+    get_current_humidity,
+    get_leak_status,
+    get_pellet_level,
+    get_full_state
+)
 
 # ===== CONFIG =====
 SAMPLE_RATE = 16_000
@@ -77,11 +89,16 @@ def record_audio_to_wav(path: str):
     Audio is saved as mono 16kHz WAV.
     """
     print("\nNospied Enter, tad runā. Kad pabeidz, nospied Enter vēlreiz.")
-    # Map Logitech presenter buttons to Enter to avoid mistakes
-    keyboard.add_hotkey('pagedown', lambda: keyboard.press_and_release('enter'))
-    keyboard.add_hotkey('pageup', lambda: keyboard.press_and_release('enter'))
-    keyboard.add_hotkey('.', lambda: keyboard.press_and_release('enter'))
-    keyboard.wait('enter')
+    # Logitech presenter button mappings only on Windows
+    if sys.platform.startswith("win"):
+        import keyboard
+        keyboard.add_hotkey('pagedown', lambda: keyboard.press_and_release('enter'))
+        keyboard.add_hotkey('pageup', lambda: keyboard.press_and_release('enter'))
+        keyboard.add_hotkey('.', lambda: keyboard.press_and_release('enter'))
+    if sys.platform.startswith("win"):
+        keyboard.wait('enter')
+    else:
+        input()  # macOS fallback: press Enter to toggle
     print("Ieraksts sākts – runā mikrofona virzienā... (Enter = stop)")
 
     frames = []
@@ -98,7 +115,10 @@ def record_audio_to_wav(path: str):
         callback=callback,
     ):
         # This keyboard.wait() blocks while callback keeps filling frames
-        keyboard.wait('enter')
+        if sys.platform.startswith("win"):
+            keyboard.wait('enter')
+        else:
+            input()  # macOS fallback
         print("Ieraksts apturēts, apstrādāju...")
 
     if not frames:
@@ -451,6 +471,79 @@ def main_loop():
                     tts_latvian_to_file(weather_reply, out_path)
                     play_audio_file(out_path)
                     continue
+
+                # ----- TAPO SMART HOME INTENTS -----
+                lt = lower_text
+
+                # Druviņas temperature
+                if "temperatūr" in lt or "cik silts" in lt:
+                    try:
+                        temp = get_current_temperature()
+                        if temp is None:
+                            msg = "Neizdodas nolasīt temperatūru Druviņās."
+                        else:
+                            msg = f"Druviņās tagad ir apmēram {temp:.1f} grādi."
+                        tts_latvian_to_file(msg, out_path)
+                        play_audio_file(out_path)
+                        continue
+                    except Exception:
+                        msg = "Radās kļūda mēģinot nolasīt temperatūru Druviņās."
+                        tts_latvian_to_file(msg, out_path)
+                        play_audio_file(out_path)
+                        continue
+
+                # Druviņas humidity
+                if "mitrum" in lt:
+                    try:
+                        hum = get_current_humidity()
+                        if hum is None:
+                            msg = "Neizdodas nolasīt mitrumu Druviņās."
+                        else:
+                            msg = f"Druviņās mitrums ir ap {hum:.0f} procentiem."
+                        tts_latvian_to_file(msg, out_path)
+                        play_audio_file(out_path)
+                        continue
+                    except Exception:
+                        msg = "Kļūda nolasot mitrumu Druviņās."
+                        tts_latvian_to_file(msg, out_path)
+                        play_audio_file(out_path)
+                        continue
+
+                # Leak detection
+                if "noplūd" in lt or "ūdens" in lt:
+                    try:
+                        leak = get_leak_status()
+                        if leak:
+                            msg = "Tiek ziņots par ūdens noplūdi Druviņās."
+                        else:
+                            msg = "Viss ir kārtībā. Noplūdes nav konstatētas."
+                        tts_latvian_to_file(msg, out_path)
+                        play_audio_file(out_path)
+                        continue
+                    except Exception:
+                        msg = "Neizdevās iegūt informāciju par noplūdēm."
+                        tts_latvian_to_file(msg, out_path)
+                        play_audio_file(out_path)
+                        continue
+
+                # Pellet level (door sensor hack)
+                if "granul" in lt or "tvertn" in lt or "līmen" in lt:
+                    try:
+                        pellet_ok = get_pellet_level()
+                        if pellet_ok is None:
+                            msg = "Neizdodas nolasīt granulu līmeņa sensoru."
+                        elif pellet_ok:
+                            msg = "Granulu līmenis izskatās labs."
+                        else:
+                            msg = "Granulu līmenis ir zems. Vajadzēs papildināt."
+                        tts_latvian_to_file(msg, out_path)
+                        play_audio_file(out_path)
+                        continue
+                    except Exception:
+                        msg = "Neizdevās nolasīt informāciju par granulu līmeni."
+                        tts_latvian_to_file(msg, out_path)
+                        play_audio_file(out_path)
+                        continue
 
                 reply_text = chat_latvian_elderly(text)
 
