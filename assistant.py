@@ -14,6 +14,8 @@ import sounddevice as sd
 import soundfile as sf
 from openai import OpenAI
 
+import keyboard
+
 # ===== CONFIG =====
 SAMPLE_RATE = 16_000
 MAX_RECORD_SECONDS = 30  # hard safety cap
@@ -75,7 +77,11 @@ def record_audio_to_wav(path: str):
     Audio is saved as mono 16kHz WAV.
     """
     print("\nNospied Enter, tad runā. Kad pabeidz, nospied Enter vēlreiz.")
-    input(">>> Nospied Enter, lai sāktu ierakstu...")
+    # Map Logitech presenter buttons to Enter to avoid mistakes
+    keyboard.add_hotkey('pagedown', lambda: keyboard.press_and_release('enter'))
+    keyboard.add_hotkey('pageup', lambda: keyboard.press_and_release('enter'))
+    keyboard.add_hotkey('.', lambda: keyboard.press_and_release('enter'))
+    keyboard.wait('enter')
     print("Ieraksts sākts – runā mikrofona virzienā... (Enter = stop)")
 
     frames = []
@@ -91,8 +97,8 @@ def record_audio_to_wav(path: str):
         dtype="float32",
         callback=callback,
     ):
-        # This input() blocks while callback keeps filling frames
-        input()
+        # This keyboard.wait() blocks while callback keeps filling frames
+        keyboard.wait('enter')
         print("Ieraksts apturēts, apstrādāju...")
 
     if not frames:
@@ -311,38 +317,69 @@ def get_youtube_url_by_id(item_id: str) -> str | None:
 
 
 def play_youtube_item(item_id: str):
-    """Open a configured YouTube item in the default browser with autoplay and
-    return focus to the PowerShell window on Windows.
-    """
+    """Open the YouTube item using Chrome with forced autoplay on Windows."""
     url = get_youtube_url_by_id(item_id)
     if not url:
         print(f"[*] Neatradu YouTube ierakstu ar ID: {item_id}")
         return
 
-    # Add autoplay parameter
+    # Add autoplay=1 parameter
     if "?" in url:
         url = url + "&autoplay=1"
     else:
         url = url + "?autoplay=1"
 
-    print(f"-> Atveru YouTube pārlūkā: {url}")
+    print(f"-> Atveru YouTube ar autoplay: {url}")
 
-    try:
-        webbrowser.open(url, new=1)
-    except Exception as e:
-        print(f"[*] Neizdevās atvērt pārlūku: {e}")
-        return
-
-    # Return focus to PowerShell on Windows
+    # ----- WINDOWS SPECIAL HANDLING -----
     if sys.platform.startswith("win"):
+        chrome_paths = [
+            r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+            r"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+            r"%ProgramFiles%\\Google\\Chrome\\Application\\chrome.exe",
+            r"%ProgramFiles(x86)%\\Google\\Chrome\\Application\\chrome.exe",
+        ]
+
+        chrome_path = None
+        for p in chrome_paths:
+            expanded = os.path.expandvars(p)
+            if os.path.isfile(expanded):
+                chrome_path = expanded
+                break
+
+        if chrome_path:
+            try:
+                subprocess.Popen([
+                    chrome_path,
+                    "--autoplay-policy=no-user-gesture-required",
+                    "--new-window",
+                    "--start-maximized",
+                    url,
+                ])
+                print("-> Chrome palaists ar autoplay atļauju.")
+            except Exception as e:
+                print(f"[*] Chrome startēšana neizdevās: {e}")
+        else:
+            print("[*] Chrome nav atrasts — izmantoju webbrowser fallback.")
+            webbrowser.open(url, new=1)
+
+        # Return focus to PowerShell
         try:
             subprocess.run([
                 "powershell",
                 "-command",
                 "(New-Object -ComObject WScript.Shell).AppActivate((Get-Process -Id $PID).MainWindowTitle)"
             ], check=False)
-        except Exception:
+        except:
             pass
+
+        return
+
+    # ----- MACOS / LINUX fallback -----
+    try:
+        webbrowser.open(url, new=1)
+    except:
+        print("[*] Neizdevās atvērt pārlūku.")
 
 
 def stop_youtube_playback():
