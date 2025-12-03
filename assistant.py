@@ -81,6 +81,13 @@ LOCAL_BOOK_STATE_PATH = os.path.join(os.path.dirname(__file__), "local_book_stat
 LOCAL_BOOKS: dict[str, dict] = {}
 # Conversation log file
 CONVERSATION_LOG = os.path.join(os.path.dirname(__file__), "logs", "conversation.log")
+# Manual extra book paths (if present)
+EXTRA_BOOKS = {
+    "dzoja_adamsone_dzimusi_brivibai": {
+        "display": "Džoja Ādamsone - Dzimusi Brīvībai",
+        "path": os.path.join(LOCAL_BOOKS_ROOT, "Džoja Ādamsone - Dzimusi Brīvībai"),
+    },
+}
 # ==================
 
 
@@ -153,6 +160,14 @@ def refresh_local_books():
                 book_id = _slugify_id(display)
                 LOCAL_BOOKS[book_id] = {"display": display, "path": author_path}
 
+    # Extra manual entries (e.g., fragments in a dedicated folder)
+    for book_id, info in EXTRA_BOOKS.items():
+        path = info["path"]
+        if os.path.isdir(path) or os.path.isfile(path):
+            files = glob.glob(os.path.join(path, "*.mp3")) if os.path.isdir(path) else [path]
+            if files:
+                LOCAL_BOOKS[book_id] = {"display": info["display"], "path": path}
+
 
 def list_local_books_for_prompt() -> str:
     """Return human-friendly list of local book folders for the system prompt."""
@@ -175,6 +190,14 @@ def _load_local_progress() -> dict:
             return raw
     except Exception:
         return {}
+
+
+def _get_book_progress(book_id: str) -> dict:
+    state = _load_local_progress()
+    val = state.get(book_id, {"file": 0, "ms": 0})
+    if isinstance(val, int):
+        val = {"file": val, "ms": 0}
+    return val
 
 
 def _save_local_progress(state: dict):
@@ -204,9 +227,7 @@ def play_local_book(book_id: str, resume: bool = False):
         return
 
     state = _load_local_progress()
-    book_state = state.get(book_id, {"file": 0, "ms": 0})
-    if isinstance(book_state, int):
-        book_state = {"file": book_state, "ms": 0}
+    book_state = _get_book_progress(book_id)
 
     start_index = book_state.get("file", 0) if resume else 0
     start_index = max(0, min(start_index, len(files) - 1))
@@ -852,7 +873,9 @@ def main_loop():
                     local_id = reply_text.split("CMD:PLAY_LOCAL:", 1)[1].strip()
                     print(f"-> Saņemta komanda atskaņot lokālu grāmatu: {local_id}")
                     log_conversation(text, reply_text, note="play_local")
-                    play_local_book(local_id, resume=False)
+                    progress = _get_book_progress(local_id)
+                    should_resume = progress.get("file", 0) or progress.get("ms", 0)
+                    play_local_book(local_id, resume=bool(should_resume))
                     continue
 
                 if reply_text.startswith("CMD:RESUME_LOCAL:"):
