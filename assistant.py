@@ -7,6 +7,9 @@ import webbrowser
 import requests
 import threading
 import time
+import json
+import re
+from typing import Optional
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -15,6 +18,7 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from openai import OpenAI
+from playsound import playsound
 
 
 import sys
@@ -68,7 +72,126 @@ YOUTUBE_ITEMS = {
 
 # Default place for weather queries – tuned for her home region
 DEFAULT_WEATHER_PLACE = "Vecpiebalga, Latvia"
+
+# Local MP3 library root (Windows desktop path by default; override with LOCAL_BOOKS_ROOT env)
+LOCAL_BOOKS_ROOT = os.getenv("LOCAL_BOOKS_ROOT") or r"C:\\Users\\user\\Desktop\\Grāmatas"
+# Where we persist playback progress (JSON with last played index per book_id)
+LOCAL_BOOK_STATE_PATH = os.path.join(os.path.dirname(__file__), "local_book_state.json")
+# Populated at startup by scanning LOCAL_BOOKS_ROOT
+LOCAL_BOOKS: dict[str, dict] = {}
+# Conversation log file
+CONVERSATION_LOG = os.path.join(os.path.dirname(__file__), "logs", "conversation.log")
 # ==================
+
+
+def _slugify_id(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9āčēģīķļņōŗšūž\s-]", "", text)
+    text = text.replace(" ", "_").replace("-", "_")
+    text = re.sub(r"_+", "_", text)
+    return text.strip("_") or "book"
+
+
+def refresh_local_books():
+    """Scan LOCAL_BOOKS_ROOT for mp3 folders and populate LOCAL_BOOKS."""
+    LOCAL_BOOKS.clear()
+    root = LOCAL_BOOKS_ROOT
+    if not root or not os.path.isdir(root):
+        print(f"[*] LOCAL_BOOKS_ROOT nav atrasts: {root}")
+        return
+
+    for author in sorted(os.listdir(root)):
+        author_path = os.path.join(root, author)
+        if not os.path.isdir(author_path):
+            continue
+
+        subfolders = [f for f in sorted(os.listdir(author_path)) if os.path.isdir(os.path.join(author_path, f))]
+        if subfolders:
+            for book in subfolders:
+                book_path = os.path.join(author_path, book)
+                files = glob.glob(os.path.join(book_path, "*.mp3"))
+                if not files:
+                    continue
+                display = f"{author} - {book}"
+                book_id = _slugify_id(display)
+                LOCAL_BOOKS[book_id] = {"display": display, "path": book_path}
+        else:
+            files = glob.glob(os.path.join(author_path, "*.mp3"))
+            if files:
+                display = author
+                book_id = _slugify_id(display)
+                LOCAL_BOOKS[book_id] = {"display": display, "path": author_path}
+
+
+def list_local_books_for_prompt() -> str:
+    """Return human-friendly list of local book folders for the system prompt."""
+    if not LOCAL_BOOKS:
+        return "(Pašlaik neatradu mp3 mapes vietā 'Grāmatas'.)"
+    lines = []
+    for book_id, info in LOCAL_BOOKS.items():
+        lines.append(f"- {info['display']} (ID: {book_id})")
+    return "\n".join(lines)
+
+
+def _load_local_progress() -> dict:
+    try:
+        with open(LOCAL_BOOK_STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_local_progress(state: dict):
+    try:
+        with open(LOCAL_BOOK_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[*] Neizdevās saglabāt progresu: {e}")
+
+
+def _natural_key(path: str):
+    """Sort helper: keeps 01, 02, 10 order."""
+    name = os.path.basename(path)
+    return [int(s) if s.isdigit() else s.lower() for s in re.split(r"(\d+)", name)]
+
+
+def play_local_book(book_id: str, resume: bool = False):
+    """Sequentially play mp3 files in the chosen folder; remember progress between runs."""
+    item = LOCAL_BOOKS.get(book_id)
+    if not item:
+        print(f"[*] Nav atrasts lokāls ieraksts ar ID: {book_id}")
+        return
+
+    files = sorted(glob.glob(os.path.join(item["path"], "*.mp3")), key=_natural_key)
+    if not files:
+        print(f"[*] Mapē nav mp3 failu: {item['path']}")
+        return
+
+    state = _load_local_progress()
+    start_index = state.get(book_id, 0) if resume else 0
+    start_index = max(0, min(start_index, len(files) - 1))
+
+    print(f"-> Atskaņoju lokālo grāmatu: {item['display']}")
+    if resume and start_index:
+        print(f"   Turpinu no faila #{start_index + 1}.")
+    print("   (Ctrl+C, lai apturētu.)")
+
+    try:
+        for idx in range(start_index, len(files)):
+            fpath = files[idx]
+            print(f"   Atskaņoju: {os.path.basename(fpath)}")
+            playsound(fpath)
+            state[book_id] = idx + 1  # saglabājam nākamo failu kā starta punktu
+            _save_local_progress(state)
+    except KeyboardInterrupt:
+        print("\n[*] Atskaņošana apturēta.")
+        _save_local_progress(state)
+    else:
+        print("-> Grāmata pabeigta.")
+
+
+# Ielādējam kataloga informāciju startā
+refresh_local_books()
 
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
@@ -89,11 +212,29 @@ def record_audio_to_wav(path: str):
         keyboard.add_hotkey('pagedown', lambda: keyboard.press_and_release('enter'))
         keyboard.add_hotkey('pageup', lambda: keyboard.press_and_release('enter'))
         keyboard.add_hotkey('.', lambda: keyboard.press_and_release('enter'))
-    if sys.platform.startswith("win"):
-        keyboard.wait('enter')
-    else:
-        input()  # macOS fallback: press Enter to toggle
-    print("Ieraksts sākts – runā mikrofona virzienā... (Enter = stop)")
+        keyboard.add_hotkey('space', lambda: keyboard.press_and_release('enter'))
+
+    def _wait_enter_or_space():
+        if sys.platform.startswith("win"):
+            keyboard.wait('enter')
+            return
+        try:
+            import termios, tty  # type: ignore
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                while True:
+                    ch = sys.stdin.read(1)
+                    if ch in ("\n", "\r", " "):
+                        break
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        except Exception:
+            input()
+
+    _wait_enter_or_space()
+    print("Ieraksts sākts – runā mikrofona virzienā... (Enter vai Space = stop)")
 
     frames = []
 
@@ -109,10 +250,7 @@ def record_audio_to_wav(path: str):
         callback=callback,
     ):
         # This keyboard.wait() blocks while callback keeps filling frames
-        if sys.platform.startswith("win"):
-            keyboard.wait('enter')
-        else:
-            input()  # macOS fallback
+        _wait_enter_or_space()
         print("Ieraksts apturēts, apstrādāju...")
 
     if not frames:
@@ -194,6 +332,7 @@ def chat_latvian_elderly(user_text: str) -> str:
     """Send Latvian text to GPT and get a Latvian reply,
     tuned for an elderly, blind user.
     """
+    refresh_local_books()  # aktualizējam lokālo sarakstu katram piegājienam
     print("-> Sūtu tekstu GPT modelim...")
     system_prompt = (
         "Tu esi balss asistents, kas runā latviešu valodā ar 88 gadus vecu, "
@@ -208,6 +347,9 @@ def chat_latvian_elderly(user_text: str) -> str:
         + "\n\n"
         "Tev ir pieejami arī šādi YouTube ieraksti (atvērsi tos pārlūkā):\n"
         + list_youtube_items_for_prompt()
+        + "\n\n"
+        "Tev ir pieejamas arī lokālās mp3 grāmatas mapē 'Grāmatas' uz Windows darbvirsmas:\n"
+        + list_local_books_for_prompt()
         + "\n\n"
         "Ja lietotāja lūdz pastāstīt, KO tu vari atskaņot no YouTube, "
         "atbildi parastā tekstā, īsi uzskaitot autorus un darbus, "
@@ -231,6 +373,13 @@ def chat_latvian_elderly(user_text: str) -> str:
         "komandu šim darbam, nevis parastu tekstu.\n"
         "Ja lietotāja vēlas apturēt YouTube atskaņošanu, atbildi tikai ar:\n"
         "  CMD:STOP_YT\n"
+        "Ja lietotāja vēlas klausīties lokālu mp3 grāmatu no mapes 'Grāmatas', "
+        "uzreiz atbildi ar komandu:\n"
+        "  CMD:PLAY_LOCAL:<ID>\n"
+        "kur <ID> atbilst pieejamajam sarakstam augstāk. Ja lietotāja saka "
+        "turpināt iepriekšējo grāmatu, atbildi ar:\n"
+        "  CMD:RESUME_LOCAL:<ID>\n"
+        "kur <ID> ir tas pats lokālais ID, kuru viņa klausījās.\n"
         "Ja lietotāja vēlme nav klausīties audiogrāmatu vai YouTube, atbildi "
         "parastā veidā sirsnīgā, mierīgā tonī.\n"
         "Tev ir pieejamas šādas balsis: 'vīrieša balss', 'sieviešu balss', "
@@ -436,6 +585,23 @@ def play_audio_file(path: str):
     sd.wait()
 
 
+def log_conversation(user_text: str, reply_text: str, note: Optional[str] = None):
+    """Append interaction to a log file for later review."""
+    try:
+        os.makedirs(os.path.dirname(CONVERSATION_LOG), exist_ok=True)
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(CONVERSATION_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{ts}\n")
+            f.write(f"USER: {user_text}\n")
+            if note:
+                f.write(f"ASSISTANT: {reply_text} [{note}]\n")
+            else:
+                f.write(f"ASSISTANT: {reply_text}\n")
+            f.write("---\n")
+    except Exception as e:
+        print(f"[*] Neizdevās ierakstīt žurnālā: {e}")
+
+
 # ===== THINKING SOUND HELPERS =====
 THINKING_SOUND_FREQ = 1200
 THINKING_SOUND_DURATION = 0.03
@@ -503,6 +669,7 @@ def main_loop():
                     weather_reply = get_weather_text(DEFAULT_WEATHER_PLACE)
                     tts_latvian_to_file(weather_reply, out_path)
                     play_audio_file(out_path)
+                    log_conversation(text, weather_reply, note="weather")
                     continue
 
                 start_thinking_sound()
@@ -516,6 +683,7 @@ def main_loop():
                 if reply_text.startswith("CMD:PLAY_BOOK:"):
                     book_id = reply_text.split("CMD:PLAY_BOOK:", 1)[1].strip()
                     print(f"-> Saņemta komanda atskaņot audiogrāmatu: {book_id}")
+                    log_conversation(text, reply_text, note="play_book")
                     play_audiobook(book_id)
                     # pēc audiogrāmatas beigām turpinām ciklu
                     continue
@@ -523,23 +691,41 @@ def main_loop():
                 if reply_text.startswith("CMD:PLAY_YT:"):
                     yt_id = reply_text.split("CMD:PLAY_YT:", 1)[1].strip()
                     print(f"-> Saņemta komanda atvērt YouTube ierakstu: {yt_id}")
+                    log_conversation(text, reply_text, note="play_yt")
                     play_youtube_item(yt_id)
+                    continue
+
+                if reply_text.startswith("CMD:PLAY_LOCAL:"):
+                    local_id = reply_text.split("CMD:PLAY_LOCAL:", 1)[1].strip()
+                    print(f"-> Saņemta komanda atskaņot lokālu grāmatu: {local_id}")
+                    log_conversation(text, reply_text, note="play_local")
+                    play_local_book(local_id, resume=False)
+                    continue
+
+                if reply_text.startswith("CMD:RESUME_LOCAL:"):
+                    local_id = reply_text.split("CMD:RESUME_LOCAL:", 1)[1].strip()
+                    print(f"-> Saņemta komanda turpināt lokālu grāmatu: {local_id}")
+                    log_conversation(text, reply_text, note="resume_local")
+                    play_local_book(local_id, resume=True)
                     continue
 
                 if reply_text.strip() == "CMD:STOP_YT":
                     print("-> Saņemta komanda apstādināt YouTube atskaņošanu.")
+                    log_conversation(text, reply_text, note="stop_yt")
                     stop_youtube_playback()
                     continue
 
                 if reply_text.startswith("CMD:SET_VOICE:"):
                     voice_label = reply_text.split("CMD:SET_VOICE:", 1)[1].strip()
                     status_msg = set_tts_voice_by_label(voice_label)
+                    log_conversation(text, reply_text, note="set_voice")
                     tts_latvian_to_file(status_msg, out_path)
                     play_audio_file(out_path)
                     continue
 
                 tts_latvian_to_file(reply_text, out_path)
                 play_audio_file(out_path)
+                log_conversation(text, reply_text)
 
             except Exception as e:
                 print(f"!!! Kļūda darbībā ar OpenAI API: {e}", file=sys.stderr)
