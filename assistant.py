@@ -71,6 +71,7 @@ YOUTUBE_ITEMS = {
 
 # Default place for weather queries – tuned for her home region
 DEFAULT_WEATHER_PLACE = "Vecpiebalga, Latvia"
+RIGA_WEATHER_PLACE = "Rīga, Latvia"
 
 # Local MP3 library root (Windows desktop path by default; override with LOCAL_BOOKS_ROOT env)
 LOCAL_BOOKS_ROOT = os.getenv("LOCAL_BOOKS_ROOT") or r"C:\\Users\\user\\Desktop\\Grāmatas"
@@ -81,6 +82,37 @@ LOCAL_BOOKS: dict[str, dict] = {}
 # Conversation log file
 CONVERSATION_LOG = os.path.join(os.path.dirname(__file__), "logs", "conversation.log")
 # ==================
+
+
+def _wait_for_enter() -> None:
+    """Block until Enter/Return is pressed."""
+    if sys.platform.startswith("win"):
+        import keyboard
+        keyboard.wait("enter")
+        return
+    try:
+        import termios, tty  # type: ignore
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while True:
+                ch = sys.stdin.read(1)
+                if ch in ("\n", "\r"):
+                    break
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    except Exception:
+        input()
+
+
+def _add_temp_enter_hotkey(callback):
+    """Register a temporary Enter hotkey (Windows only); returns a remover."""
+    if not sys.platform.startswith("win"):
+        return lambda: None
+    import keyboard
+    hotkey_id = keyboard.add_hotkey("enter", callback)
+    return lambda: keyboard.remove_hotkey(hotkey_id)
 
 
 def _slugify_id(text: str) -> str:
@@ -135,7 +167,12 @@ def list_local_books_for_prompt() -> str:
 def _load_local_progress() -> dict:
     try:
         with open(LOCAL_BOOK_STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+            raw = json.load(f)
+            # migrate old int-only format -> dict
+            for k, v in list(raw.items()):
+                if isinstance(v, int):
+                    raw[k] = {"file": v, "ms": 0}
+            return raw
     except Exception:
         return {}
 
@@ -167,26 +204,41 @@ def play_local_book(book_id: str, resume: bool = False):
         return
 
     state = _load_local_progress()
-    start_index = state.get(book_id, 0) if resume else 0
+    book_state = state.get(book_id, {"file": 0, "ms": 0})
+    if isinstance(book_state, int):
+        book_state = {"file": book_state, "ms": 0}
+
+    start_index = book_state.get("file", 0) if resume else 0
     start_index = max(0, min(start_index, len(files) - 1))
+    start_ms = book_state.get("ms", 0) if resume else 0
 
     print(f"-> Atskaņoju lokālo grāmatu: {item['display']}")
     if resume and start_index:
         print(f"   Turpinu no faila #{start_index + 1}.")
+        if start_ms:
+            print(f"   Turpinu no aptuveni {start_ms/1000:.1f} sekundes.")
     print("   (Ctrl+C, lai apturētu.)")
 
     try:
         for idx in range(start_index, len(files)):
             fpath = files[idx]
             print(f"   Atskaņoju: {os.path.basename(fpath)}")
-            play_mp3_file(fpath)
-            state[book_id] = idx + 1  # saglabājam nākamo failu kā starta punktu
+            offset = start_ms if idx == start_index else 0
+            stopped, pos_ms = play_mp3_file(fpath, start_ms=offset)
+            if stopped:
+                state[book_id] = {"file": idx, "ms": pos_ms}
+                _save_local_progress(state)
+                print("   Atskaņošana apturēta (Enter).")
+                return
+            state[book_id] = {"file": idx + 1, "ms": 0}  # nākamais fails
             _save_local_progress(state)
     except KeyboardInterrupt:
         print("\n[*] Atskaņošana apturēta.")
         _save_local_progress(state)
     else:
         print("-> Grāmata pabeigta.")
+        state[book_id] = {"file": len(files) - 1, "ms": 0}
+        _save_local_progress(state)
 
 
 # Ielādējam kataloga informāciju startā
@@ -327,6 +379,12 @@ def get_weather_text(place: str = DEFAULT_WEATHER_PLACE) -> str:
         return "Neizdevās pieslēgties laikapstākļu servisam."
 
 
+def get_time_text() -> str:
+    """Return a short Latvian string with the current local time."""
+    now = time.localtime()
+    return time.strftime("Šobrīd ir %H:%M.", now)
+
+
 def chat_latvian_elderly(user_text: str) -> str:
     """Send Latvian text to GPT and get a Latvian reply,
     tuned for an elderly, blind user.
@@ -386,6 +444,8 @@ def chat_latvian_elderly(user_text: str) -> str:
         "no šīm, TAD NEATBILDI parastā tekstā, bet atbildi tikai ar komandu:\n"
         "  CMD:SET_VOICE:<balses_nosaukums>\n"
         "piemēram: CMD:SET_VOICE:vīrieša balss.\n"
+        "Tu vari arī atbildēt ar pašreizējo laiku (pulkstenis) un laikapstākļiem "
+        "Rīgā, ja lietotāja to vaicā.\n"
     )
 
     resp = client.chat.completions.create(
@@ -579,33 +639,92 @@ def play_audio_file(path: str):
     Play an audio file (mp3/wav) through default speakers.
     """
     print("-> Atskaņoju atbildi...")
-    data, samplerate = sf.read(path, dtype="float32")
-    sd.play(data, samplerate)
-    sd.wait()
+    stop_flag = False
+
+    def on_enter():
+        nonlocal stop_flag
+        stop_flag = True
+        try:
+            sd.stop()
+        except Exception:
+            pass
+
+    remover = _add_temp_enter_hotkey(on_enter)
+    try:
+        data, samplerate = sf.read(path, dtype="float32")
+        sd.play(data, samplerate)
+        sd.wait()
+    finally:
+        try:
+            remover()
+        except Exception:
+            pass
+    return stop_flag
 
 
-def _play_mp3_windows(path: str):
-    """Play mp3 on Windows using winmm (no external deps). Blocks until done."""
+def _play_mp3_windows(path: str, start_ms: int = 0):
+    """Play mp3 on Windows using winmm (no external deps). Returns (stopped, last_pos_ms)."""
     import ctypes
+
     alias = f"mp3_{int(time.time() * 1000)}"
     mci = ctypes.windll.winmm.mciSendStringW
-    mci(f'open "{path}" type mpegvideo alias {alias}', None, 0, None)
-    mci(f"play {alias} wait", None, 0, None)
-    mci(f"close {alias}", None, 0, None)
+
+    def mci_cmd(cmd: str) -> str:
+        buf = ctypes.create_unicode_buffer(255)
+        mci(cmd, buf, 254, None)
+        return buf.value
+
+    stopped = False
+    mci_cmd(f'open "{path}" type mpegvideo alias {alias}')
+    if start_ms > 0:
+        mci_cmd(f"seek {alias} to {int(start_ms)}")
+
+    def on_enter():
+        nonlocal stopped
+        stopped = True
+        mci_cmd(f"stop {alias}")
+
+    remover = _add_temp_enter_hotkey(on_enter)
+    try:
+        mci_cmd(f"play {alias}")
+        while True:
+            mode = mci_cmd(f"status {alias} mode")
+            if mode != "playing":
+                break
+            if stopped:
+                break
+            time.sleep(0.1)
+        pos = mci_cmd(f"status {alias} position")
+    finally:
+        try:
+            remover()
+        except Exception:
+            pass
+        mci_cmd(f"close {alias}")
+
+    try:
+        pos_ms = int(pos)
+    except Exception:
+        pos_ms = 0
+    return stopped, pos_ms
 
 
-def play_mp3_file(path: str):
-    """Cross-platform mp3 playback without playsound dependency."""
+def play_mp3_file(path: str, start_ms: int = 0):
+    """Cross-platform mp3 playback without playsound dependency. Returns (stopped, last_pos_ms)."""
     if sys.platform.startswith("win"):
-        _play_mp3_windows(path)
+        return _play_mp3_windows(path, start_ms=start_ms)
     elif sys.platform == "darwin":
-        subprocess.run(["afplay", path])
+        proc = subprocess.Popen(["afplay", path])
+        proc.wait()
+        return False, 0
     else:
         # Linux fallback: try ffplay if present
         try:
             subprocess.run(["ffplay", "-nodisp", "-autoexit", path], check=False)
+            return False, 0
         except FileNotFoundError:
             print("[*] mp3 atskaņošana nav atbalstīta šajā platformā (nav ffplay).")
+            return False, 0
 
 
 def log_conversation(user_text: str, reply_text: str, note: Optional[str] = None):
@@ -688,8 +807,16 @@ def main_loop():
                     break
 
                 lower_text = text.lower()
+                if any(k in lower_text for k in ["pulksten", "cikos", "cik ir laiks", "laiks ir cik"]):
+                    time_reply = get_time_text()
+                    tts_latvian_to_file(time_reply, out_path)
+                    play_audio_file(out_path)
+                    log_conversation(text, time_reply, note="time")
+                    continue
+
                 if "laikapstāk" in lower_text or "kāds laiks" in lower_text or "kads laiks" in lower_text:
-                    weather_reply = get_weather_text(DEFAULT_WEATHER_PLACE)
+                    place = RIGA_WEATHER_PLACE if "rīg" in lower_text or "riga" in lower_text else DEFAULT_WEATHER_PLACE
+                    weather_reply = get_weather_text(place)
                     tts_latvian_to_file(weather_reply, out_path)
                     play_audio_file(out_path)
                     log_conversation(text, weather_reply, note="weather")
@@ -716,6 +843,9 @@ def main_loop():
                     print(f"-> Saņemta komanda atvērt YouTube ierakstu: {yt_id}")
                     log_conversation(text, reply_text, note="play_yt")
                     play_youtube_item(yt_id)
+                    print("   (Enter, lai aizvērtu YouTube un turpinātu sarunu.)")
+                    _wait_for_enter()
+                    stop_youtube_playback()
                     continue
 
                 if reply_text.startswith("CMD:PLAY_LOCAL:"):
