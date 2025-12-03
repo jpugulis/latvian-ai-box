@@ -18,7 +18,6 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from openai import OpenAI
-from playsound import playsound
 
 
 import sys
@@ -180,7 +179,7 @@ def play_local_book(book_id: str, resume: bool = False):
         for idx in range(start_index, len(files)):
             fpath = files[idx]
             print(f"   Atskaņoju: {os.path.basename(fpath)}")
-            playsound(fpath)
+            play_mp3_file(fpath)
             state[book_id] = idx + 1  # saglabājam nākamo failu kā starta punktu
             _save_local_progress(state)
     except KeyboardInterrupt:
@@ -583,6 +582,30 @@ def play_audio_file(path: str):
     data, samplerate = sf.read(path, dtype="float32")
     sd.play(data, samplerate)
     sd.wait()
+
+
+def _play_mp3_windows(path: str):
+    """Play mp3 on Windows using winmm (no external deps). Blocks until done."""
+    import ctypes
+    alias = f"mp3_{int(time.time() * 1000)}"
+    mci = ctypes.windll.winmm.mciSendStringW
+    mci(f'open "{path}" type mpegvideo alias {alias}', None, 0, None)
+    mci(f"play {alias} wait", None, 0, None)
+    mci(f"close {alias}", None, 0, None)
+
+
+def play_mp3_file(path: str):
+    """Cross-platform mp3 playback without playsound dependency."""
+    if sys.platform.startswith("win"):
+        _play_mp3_windows(path)
+    elif sys.platform == "darwin":
+        subprocess.run(["afplay", path])
+    else:
+        # Linux fallback: try ffplay if present
+        try:
+            subprocess.run(["ffplay", "-nodisp", "-autoexit", path], check=False)
+        except FileNotFoundError:
+            print("[*] mp3 atskaņošana nav atbalstīta šajā platformā (nav ffplay).")
 
 
 def log_conversation(user_text: str, reply_text: str, note: Optional[str] = None):

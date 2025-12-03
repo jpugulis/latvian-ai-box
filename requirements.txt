@@ -5,4 +5,3 @@ soundfile
 requests
 python-dotenv
 keyboard; platform_system=="Windows"
-playsound
