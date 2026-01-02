@@ -96,6 +96,7 @@ recording_flag = threading.Event()
 playback_lock = threading.Lock()
 scheduler_stop_event = threading.Event()
 scheduler_thread = None
+exit_event = threading.Event()
 # ==================
 
 
@@ -1085,6 +1086,8 @@ def _scheduler_loop():
     last_hourly = None  # (yearday, hour)
     last_weather_day = None
     last_evening_day = None
+    last_text_morning_day = None
+    last_text_evening_day = None
 
     while not scheduler_stop_event.is_set():
         now = time.localtime()
@@ -1100,6 +1103,16 @@ def _scheduler_loop():
         if now.tm_hour == 9 and now.tm_min == 0 and now.tm_yday != last_weather_day:
             if _speak_scheduled_message(get_weather_text(RIGA_WEATHER_PLACE), "sched_weather"):
                 last_weather_day = now.tm_yday
+
+        # Morning text forecast after the 09:00 announcement
+        if now.tm_hour == 9 and now.tm_min == 1 and now.tm_yday != last_text_morning_day:
+            if _speak_scheduled_message(get_text_forecast_latvia(), "sched_text_forecast_morning"):
+                last_text_morning_day = now.tm_yday
+
+        # Evening text forecast after the 16:00 announcement
+        if now.tm_hour == 16 and now.tm_min == 1 and now.tm_yday != last_text_evening_day:
+            if _speak_scheduled_message(get_text_forecast_latvia(), "sched_text_forecast_evening"):
+                last_text_evening_day = now.tm_yday
 
         # Evening chapter around 22:00 (tolerate first 5 minutes)
         if now.tm_hour == 22 and now.tm_min < 5 and now.tm_yday != last_evening_day:
@@ -1186,7 +1199,15 @@ def main_loop():
     print("=== Latviešu balss asistents (prototips) ===")
     print("Ctrl+C, lai izietu.\n")
 
+    esc_remover = None
+    if sys.platform.startswith("win"):
+        import keyboard
+        esc_remover = keyboard.add_hotkey("esc", lambda: exit_event.set())
+
     while True:
+        if exit_event.is_set():
+            print("Saņemta ESC komanda – iziešu.")
+            break
         with tempfile.TemporaryDirectory() as tmpdir:
             wav_path = os.path.join(tmpdir, "input.wav")
             out_path = os.path.join(tmpdir, "reply.mp3")
@@ -1284,6 +1305,12 @@ def main_loop():
             except Exception as e:
                 print(f"!!! Kļūda darbībā ar OpenAI API: {e}", file=sys.stderr)
                 print("Pamēģini vēlreiz vai pārbaudi savu interneta savienojumu / API key.")
+    if esc_remover:
+        try:
+            import keyboard
+            keyboard.remove_hotkey(esc_remover)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
