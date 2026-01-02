@@ -892,7 +892,7 @@ def run_scheduler_ui():
     print("\n=== Vakara lasījuma iestatījumi ===")
     while True:
         print(describe_scheduled_book())
-        print("Komandas: [L] izvēlēties grāmatu  [F] izvēlēties failu  [Q] turpināt")
+        print("Komandas: [L] izvēlēties grāmatu  [F] izvēlēties failu  [H] pārbaudīt laika paziņojumu  [S] sākt vakara lasījumu tagad  [Q] turpināt")
         choice = input(">> ").strip().lower()
         if choice in {"q", "quit", ""}:
             break
@@ -910,6 +910,14 @@ def run_scheduler_ui():
                 print("Vispirms izvēlies vakara grāmatu.")
                 continue
             _prompt_file_selection(SCHEDULED_BOOK_ID)
+            continue
+        if choice in {"h", "hour", "time"}:
+            if not _speak_scheduled_message(get_time_text(), "sched_time_manual"):
+                print("Paziņojums izlaists — sistēma pašlaik atskaņo/ieraksta.")
+            continue
+        if choice in {"s", "start", "play"}:
+            if not _play_scheduled_chapter():
+                print("Neizdevās sākt lasījumu (iespējams, atskaņošana vai ieraksts jau notiek).")
             continue
         print("Neatpazīta izvēle.")
 
@@ -1009,7 +1017,7 @@ def _scheduler_loop():
 
         # Morning weather around 09:00
         if now.tm_hour == 9 and now.tm_min == 0 and now.tm_yday != last_weather_day:
-            if _speak_scheduled_message(get_weather_text(DEFAULT_WEATHER_PLACE), "sched_weather"):
+            if _speak_scheduled_message(get_weather_text(RIGA_WEATHER_PLACE), "sched_weather"):
                 last_weather_day = now.tm_yday
 
         # Evening chapter around 22:00 (tolerate first 5 minutes)
