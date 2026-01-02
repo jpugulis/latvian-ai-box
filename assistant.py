@@ -892,7 +892,7 @@ def run_scheduler_ui():
     print("\n=== Vakara lasījuma iestatījumi ===")
     while True:
         print(describe_scheduled_book())
-        print("Komandas: [L] izvēlēties grāmatu  [F] izvēlēties failu  [H] pārbaudīt laika paziņojumu  [S] sākt vakara lasījumu tagad  [Q] turpināt")
+        print("Komandas: [L] izvēlēties grāmatu  [F] izvēlēties failu  [H] pārbaudīt laika paziņojumu  [W] pārbaudīt laikapstākļus Rīgā  [S] sākt vakara lasījumu tagad  [Q] turpināt")
         choice = input(">> ").strip().lower()
         if choice in {"q", "quit", ""}:
             break
@@ -913,6 +913,10 @@ def run_scheduler_ui():
             continue
         if choice in {"h", "hour", "time"}:
             if not _speak_scheduled_message(get_time_text(), "sched_time_manual"):
+                print("Paziņojums izlaists — sistēma pašlaik atskaņo/ieraksta.")
+            continue
+        if choice in {"w", "weather"}:
+            if not _speak_scheduled_message(get_weather_text(RIGA_WEATHER_PLACE), "sched_weather_manual"):
                 print("Paziņojums izlaists — sistēma pašlaik atskaņo/ieraksta.")
             continue
         if choice in {"s", "start", "play"}:
