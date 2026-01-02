@@ -32,7 +32,11 @@ TRANSCRIBE_MODEL = "gpt-4o-transcribe"   # or "whisper-1"
 CHAT_MODEL = "gpt-4.1"                   # main brain
 TTS_MODEL = "gpt-4o-mini-tts"            # newer text-to-speech model
 TTS_VOICE = "onyx"                       # voice (multilingual, more male)
-SCHEDULED_BOOK_ID = os.getenv("SCHEDULED_BOOK_ID")  # book ID used for 22:00 chapter reads
+SCHEDULED_BOOK_ID = os.getenv("SCHEDULED_BOOK_ID")  # book ID used for scheduled chapter reads
+DEFAULT_READING_TIMES = ["23:10"]        # default nightly reading times (HH:MM, 24h)
+DEFAULT_FILES_PER_SESSION = 1            # how many mp3 files to play per scheduled run
+SCHEDULED_READING_TIMES = DEFAULT_READING_TIMES.copy()
+SCHEDULED_FILES_PER_SESSION = DEFAULT_FILES_PER_SESSION
 
 # Available TTS voices user can choose from (spoken label -> OpenAI voice name)
 AVAILABLE_VOICES = {
@@ -82,7 +86,7 @@ LOCAL_BOOK_STATE_PATH = os.path.join(os.path.dirname(__file__), "local_book_stat
 LOCAL_BOOKS: dict[str, dict] = {}
 # Conversation log file
 CONVERSATION_LOG = os.path.join(os.path.dirname(__file__), "logs", "conversation.log")
-# Where we persist the selected nightly book for 22:00 reading
+# Where we persist the selected nightly book and schedule
 SCHEDULED_BOOK_CONFIG = os.path.join(os.path.dirname(__file__), "scheduled_book.json")
 # Manual extra book paths (if present)
 EXTRA_BOOKS = {
@@ -217,39 +221,127 @@ def _save_local_progress(state: dict):
         print(f"[*] Neizdevās saglabāt progresu: {e}")
 
 
-def _load_scheduled_book_id() -> Optional[str]:
-    """Return scheduled book ID from persisted config or env fallback."""
+def _parse_time_string(value: str) -> Optional[str]:
+    match = re.match(r"^(\d{1,2}):(\d{2})$", value.strip())
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if 0 <= hour < 24 and 0 <= minute < 60:
+        return f"{hour:02d}:{minute:02d}"
+    return None
+
+
+def _normalize_reading_times(raw) -> list[str]:
+    if isinstance(raw, str):
+        raw = [raw]
+    times: list[str] = []
+    if isinstance(raw, list):
+        for entry in raw:
+            parsed = _parse_time_string(str(entry))
+            if parsed and parsed not in times:
+                times.append(parsed)
+    return times
+
+
+def _load_scheduled_config() -> dict:
+    """Return persisted scheduler settings with defaults."""
+    cfg = {
+        "book_id": SCHEDULED_BOOK_ID,
+        "reading_times": DEFAULT_READING_TIMES.copy(),
+        "files_per_session": DEFAULT_FILES_PER_SESSION,
+    }
     try:
         with open(SCHEDULED_BOOK_CONFIG, "r", encoding="utf-8") as f:
             data = json.load(f)
             if isinstance(data, dict):
-                val = data.get("book_id")
-                if val:
-                    return val
+                if data.get("book_id") is not None:
+                    cfg["book_id"] = data.get("book_id")
+                times = _normalize_reading_times(data.get("reading_times") or data.get("reading_time"))
+                if times:
+                    cfg["reading_times"] = times
+                fps = data.get("files_per_session")
+                if isinstance(fps, int) and fps >= 1:
+                    cfg["files_per_session"] = fps
     except FileNotFoundError:
         pass
     except Exception as e:
         print(f"[*] Neizdevās nolasīt scheduled_book.json: {e}")
-    return SCHEDULED_BOOK_ID
+    return cfg
 
 
-def _persist_scheduled_book_id(book_id: Optional[str]):
+def _persist_scheduled_config():
     try:
+        payload = {
+            "book_id": SCHEDULED_BOOK_ID,
+            "reading_times": SCHEDULED_READING_TIMES or DEFAULT_READING_TIMES,
+            "files_per_session": max(1, SCHEDULED_FILES_PER_SESSION),
+        }
         with open(SCHEDULED_BOOK_CONFIG, "w", encoding="utf-8") as f:
-            json.dump({"book_id": book_id}, f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[*] Neizdevās saglabāt scheduled_book.json: {e}")
+
+
+def _apply_scheduled_config(cfg: dict):
+    """Load scheduler settings into globals without persisting."""
+    global SCHEDULED_BOOK_ID, SCHEDULED_READING_TIMES, SCHEDULED_FILES_PER_SESSION
+    SCHEDULED_BOOK_ID = cfg.get("book_id")
+    times = _normalize_reading_times(cfg.get("reading_times"))
+    SCHEDULED_READING_TIMES = times if times else DEFAULT_READING_TIMES.copy()
+    fps = cfg.get("files_per_session", DEFAULT_FILES_PER_SESSION)
+    if not isinstance(fps, int) or fps < 1:
+        fps = DEFAULT_FILES_PER_SESSION
+    SCHEDULED_FILES_PER_SESSION = fps
 
 
 def set_scheduled_book_id(book_id: Optional[str]):
     """Update the global scheduled book ID and persist it for future runs."""
     global SCHEDULED_BOOK_ID
     SCHEDULED_BOOK_ID = book_id
-    _persist_scheduled_book_id(book_id)
+    _persist_scheduled_config()
+
+
+def set_scheduled_reading_times(times):
+    """Update scheduled reading times (list of HH:MM strings)."""
+    global SCHEDULED_READING_TIMES
+    normalized = _normalize_reading_times(times)
+    if not normalized:
+        normalized = DEFAULT_READING_TIMES.copy()
+    SCHEDULED_READING_TIMES = normalized
+    _persist_scheduled_config()
+
+
+def set_scheduled_files_per_session(count: int):
+    """Update how many files are played per scheduled run."""
+    global SCHEDULED_FILES_PER_SESSION
+    try:
+        num = int(count)
+    except Exception:
+        num = DEFAULT_FILES_PER_SESSION
+    if num < 1:
+        num = DEFAULT_FILES_PER_SESSION
+    SCHEDULED_FILES_PER_SESSION = num
+    _persist_scheduled_config()
+
+
+def _get_effective_reading_times() -> list[str]:
+    """Return current reading times with defaults applied."""
+    times = _normalize_reading_times(SCHEDULED_READING_TIMES)
+    return times if times else DEFAULT_READING_TIMES.copy()
+
+
+def _reading_time_phrase() -> str:
+    """Short human phrase describing the active schedule."""
+    times = _get_effective_reading_times()
+    if not times:
+        return "norādītais lasījuma laiks"
+    if len(times) == 1:
+        return f"laiks {times[0]}"
+    return f"viens no iestatītajiem laikiem ({', '.join(times)})"
 
 
 def describe_scheduled_book() -> str:
-    """Return human-readable status for the scheduled 22:00 book."""
+    """Return human-readable status for the scheduled book."""
     refresh_local_books()
     if not SCHEDULED_BOOK_ID:
         return "Vakara lasījumam nav izvēlēta grāmata."
@@ -262,10 +354,13 @@ def describe_scheduled_book() -> str:
     progress = _get_book_progress(SCHEDULED_BOOK_ID)
     idx = max(0, min(progress.get("file", 0), max(len(files) - 1, 0)))
     next_file = os.path.basename(files[idx]) if files else "nav mp3 failu"
+    times_text = ", ".join(_get_effective_reading_times())
 
     return (
         f"Vakara lasījumam izvēlēts: {item['display']} (ID: {SCHEDULED_BOOK_ID}). "
-        f"Nākamais fails: {next_file}."
+        f"Nākamais fails: {next_file}. "
+        f"Lasījuma laiki: {times_text or '23:10'}. "
+        f"Faili vienā reizē: {SCHEDULED_FILES_PER_SESSION}."
     )
 
 
@@ -326,7 +421,7 @@ def play_local_book(book_id: str, resume: bool = False):
 
 # Ielādējam kataloga informāciju startā
 refresh_local_books()
-set_scheduled_book_id(_load_scheduled_book_id())
+_apply_scheduled_config(_load_scheduled_config())
 
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
@@ -961,12 +1056,54 @@ def _prompt_file_selection(book_id: str, max_items: int = 100):
     print(f"-> Vakara lasījums sāksies no faila #{choice}: {os.path.basename(files[target_idx])}")
 
 
+def _prompt_reading_times():
+    """Let user set one or multiple scheduled times (HH:MM)."""
+    current = ", ".join(SCHEDULED_READING_TIMES or DEFAULT_READING_TIMES)
+    prompt = input(f"Ievadi lasījuma laikus HH:MM (komatiem atdalīti) [esošie: {current}]: ").strip()
+    if not prompt:
+        return
+
+    parts = [p.strip() for p in re.split(r"[;,]", prompt) if p.strip()]
+    parsed = []
+    for part in parts:
+        normalized = _parse_time_string(part)
+        if not normalized:
+            print(f"Neizdevās saprast laiku: {part}")
+            continue
+        if normalized not in parsed:
+            parsed.append(normalized)
+
+    if not parsed:
+        print("Neizdevās iestatīt nevienu laiku (formāts: HH:MM, piem., 23:10).")
+        return
+
+    set_scheduled_reading_times(parsed)
+    print(f"-> Lasījuma laiki iestatīti: {', '.join(parsed)}")
+
+
+def _prompt_files_per_session():
+    """Let user set how many files get played in each scheduled run."""
+    prompt = input(f"Cik failus atskaņot vienā lasījumā? [esošais: {SCHEDULED_FILES_PER_SESSION}]: ").strip()
+    if not prompt:
+        return
+    try:
+        count = int(prompt)
+    except ValueError:
+        print("Lūdzu ievadi skaitli.")
+        return
+    if count < 1:
+        print("Skaitlim jābūt vismaz 1.")
+        return
+    set_scheduled_files_per_session(count)
+    print(f"-> Katrā lasījumā atskaņošu {count} failu(s).")
+
+
 def run_scheduler_ui():
     """Simple console UI to view and change the nightly audiobook + file."""
     print("\n=== Vakara lasījuma iestatījumi ===")
     while True:
         print(describe_scheduled_book())
-        print("Komandas: [L] izvēlēties grāmatu  [F] izvēlēties failu  [H] pārbaudīt laika paziņojumu  [W] pārbaudīt laikapstākļus Rīgā  [T] teksta prognoze  [S] sākt vakara lasījumu tagad  [Q] turpināt")
+        print("Komandas: [L] izvēlēties grāmatu  [F] izvēlēties failu  [R] iestatīt laikus  [C] failu skaits  [H] pārbaudīt laika paziņojumu  [W] pārbaudīt laikapstākļus Rīgā  [T] teksta prognoze  [S] sākt vakara lasījumu tagad  [Q] turpināt")
         choice = input(">> ").strip().lower()
         if choice in {"q", "quit", ""}:
             break
@@ -984,6 +1121,12 @@ def run_scheduler_ui():
                 print("Vispirms izvēlies vakara grāmatu.")
                 continue
             _prompt_file_selection(SCHEDULED_BOOK_ID)
+            continue
+        if choice in {"r", "times", "laiks"}:
+            _prompt_reading_times()
+            continue
+        if choice in {"c", "count", "skaits"}:
+            _prompt_files_per_session()
             continue
         if choice in {"h", "hour", "time"}:
             if not _speak_scheduled_message(get_time_text(), "sched_time_manual"):
@@ -1038,14 +1181,17 @@ def _speak_scheduled_message(text: str, note: str) -> bool:
 
 def _play_scheduled_chapter() -> bool:
     """
-    Play the next chapter (single mp3 file) from SCHEDULED_BOOK_ID at 22:00.
+    Play the next chapter(s) from SCHEDULED_BOOK_ID at the configured times.
     Returns True if we handled the trigger (even with an error message), False if deferred.
     """
     if recording_flag.is_set() or playback_lock.locked():
         return False
 
     if not SCHEDULED_BOOK_ID:
-        _speak_scheduled_message("Ir vakars, 22:00, bet vakara lasījumam nav izvēlēta grāmata.", "sched_evening_missing_book")
+        _speak_scheduled_message(
+            f"Ir {_reading_time_phrase()}, bet vakara lasījumam nav izvēlēta grāmata.",
+            "sched_evening_missing_book",
+        )
         return True
 
     refresh_local_books()
@@ -1065,27 +1211,40 @@ def _play_scheduled_chapter() -> bool:
         _speak_scheduled_message(f"Grāmata {item['display']} jau ir pabeigta.", "sched_evening_complete")
         return True
     idx = max(0, idx)
-    chapter_path = files[idx]
+    files_to_play = min(max(1, SCHEDULED_FILES_PER_SESSION), len(files) - idx)
+    chapter_paths = files[idx : idx + files_to_play]
 
     def _play():
         with playback_lock:
-            stopped, pos_ms = play_mp3_file(chapter_path)
+            current_idx = idx
+            stopped = False
+            pos_ms = 0
+            for chapter_path in chapter_paths:
+                stopped, pos_ms = play_mp3_file(chapter_path)
+                if stopped:
+                    break
+                current_idx += 1
         state = _load_local_progress()
         if stopped:
-            state[SCHEDULED_BOOK_ID] = {"file": idx, "ms": pos_ms}
+            state[SCHEDULED_BOOK_ID] = {"file": current_idx, "ms": pos_ms}
         else:
-            state[SCHEDULED_BOOK_ID] = {"file": min(idx + 1, len(files) - 1), "ms": 0}
+            state[SCHEDULED_BOOK_ID] = {"file": min(current_idx, len(files)), "ms": 0}
         _save_local_progress(state)
 
     threading.Thread(target=_play, daemon=True).start()
-    _speak_scheduled_message(f"Tagad lasu vakara nodaļu no {item['display']}.", "sched_evening_start")
+    played_count = len(chapter_paths)
+    if played_count == 1:
+        start_msg = f"Tagad lasu vakara nodaļu no {item['display']}."
+    else:
+        start_msg = f"Tagad lasu {played_count} vakara nodaļas no {item['display']}."
+    _speak_scheduled_message(start_msg, "sched_evening_start")
     return True
 
 
 def _scheduler_loop():
     last_hourly = None  # (yearday, hour)
     last_weather_day = None
-    last_evening_day = None
+    last_evening_by_time = {}
     last_text_morning_day = None
     last_text_evening_day = None
 
@@ -1114,10 +1273,17 @@ def _scheduler_loop():
             if _speak_scheduled_message(get_text_forecast_latvia(), "sched_text_forecast_evening"):
                 last_text_evening_day = now.tm_yday
 
-        # Evening chapter around 22:00 (tolerate first 5 minutes)
-        if now.tm_hour == 22 and now.tm_min < 5 and now.tm_yday != last_evening_day:
-            if _play_scheduled_chapter():
-                last_evening_day = now.tm_yday
+        # Scheduled chapters (tolerate first 5 minutes of each configured time)
+        for time_str in _get_effective_reading_times():
+            parsed = _parse_time_string(time_str)
+            if not parsed:
+                continue
+            hour, minute = map(int, parsed.split(":"))
+            if now.tm_hour == hour and 0 <= now.tm_min - minute < 5:
+                last_run = last_evening_by_time.get(parsed)
+                if last_run != now.tm_yday:
+                    if _play_scheduled_chapter():
+                        last_evening_by_time[parsed] = now.tm_yday
 
         scheduler_stop_event.wait(20)
 
