@@ -32,6 +32,7 @@ TRANSCRIBE_MODEL = "gpt-4o-transcribe"   # or "whisper-1"
 CHAT_MODEL = "gpt-4.1"                   # main brain
 TTS_MODEL = "gpt-4o-mini-tts"            # newer text-to-speech model
 TTS_VOICE = "onyx"                       # voice (multilingual, more male)
+SCHEDULED_BOOK_ID = os.getenv("SCHEDULED_BOOK_ID")  # book ID used for 22:00 chapter reads
 
 # Available TTS voices user can choose from (spoken label -> OpenAI voice name)
 AVAILABLE_VOICES = {
@@ -81,6 +82,8 @@ LOCAL_BOOK_STATE_PATH = os.path.join(os.path.dirname(__file__), "local_book_stat
 LOCAL_BOOKS: dict[str, dict] = {}
 # Conversation log file
 CONVERSATION_LOG = os.path.join(os.path.dirname(__file__), "logs", "conversation.log")
+# Where we persist the selected nightly book for 22:00 reading
+SCHEDULED_BOOK_CONFIG = os.path.join(os.path.dirname(__file__), "scheduled_book.json")
 # Manual extra book paths (if present)
 EXTRA_BOOKS = {
     "dzoja_adamsone_dzimusi_brivibai": {
@@ -88,6 +91,11 @@ EXTRA_BOOKS = {
         "path": os.path.join(LOCAL_BOOKS_ROOT, "Džoja Ādamsone - Dzimusi Brīvībai"),
     },
 }
+# Shared runtime flags/locks
+recording_flag = threading.Event()
+playback_lock = threading.Lock()
+scheduler_stop_event = threading.Event()
+scheduler_thread = None
 # ==================
 
 
@@ -208,6 +216,58 @@ def _save_local_progress(state: dict):
         print(f"[*] Neizdevās saglabāt progresu: {e}")
 
 
+def _load_scheduled_book_id() -> Optional[str]:
+    """Return scheduled book ID from persisted config or env fallback."""
+    try:
+        with open(SCHEDULED_BOOK_CONFIG, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                val = data.get("book_id")
+                if val:
+                    return val
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[*] Neizdevās nolasīt scheduled_book.json: {e}")
+    return SCHEDULED_BOOK_ID
+
+
+def _persist_scheduled_book_id(book_id: Optional[str]):
+    try:
+        with open(SCHEDULED_BOOK_CONFIG, "w", encoding="utf-8") as f:
+            json.dump({"book_id": book_id}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[*] Neizdevās saglabāt scheduled_book.json: {e}")
+
+
+def set_scheduled_book_id(book_id: Optional[str]):
+    """Update the global scheduled book ID and persist it for future runs."""
+    global SCHEDULED_BOOK_ID
+    SCHEDULED_BOOK_ID = book_id
+    _persist_scheduled_book_id(book_id)
+
+
+def describe_scheduled_book() -> str:
+    """Return human-readable status for the scheduled 22:00 book."""
+    refresh_local_books()
+    if not SCHEDULED_BOOK_ID:
+        return "Vakara lasījumam nav izvēlēta grāmata."
+
+    item = LOCAL_BOOKS.get(SCHEDULED_BOOK_ID)
+    if not item:
+        return f"Vakara lasījumam saglabātais ID '{SCHEDULED_BOOK_ID}' vairs nav atrodams."
+
+    files = sorted(glob.glob(os.path.join(item["path"], "*.mp3")), key=_natural_key)
+    progress = _get_book_progress(SCHEDULED_BOOK_ID)
+    idx = max(0, min(progress.get("file", 0), max(len(files) - 1, 0)))
+    next_file = os.path.basename(files[idx]) if files else "nav mp3 failu"
+
+    return (
+        f"Vakara lasījumam izvēlēts: {item['display']} (ID: {SCHEDULED_BOOK_ID}). "
+        f"Nākamais fails: {next_file}."
+    )
+
+
 def _natural_key(path: str):
     """Sort helper: keeps 01, 02, 10 order."""
     name = os.path.basename(path)
@@ -241,18 +301,19 @@ def play_local_book(book_id: str, resume: bool = False):
     print("   (Ctrl+C, lai apturētu.)")
 
     try:
-        for idx in range(start_index, len(files)):
-            fpath = files[idx]
-            print(f"   Atskaņoju: {os.path.basename(fpath)}")
-            offset = start_ms if idx == start_index else 0
-            stopped, pos_ms = play_mp3_file(fpath, start_ms=offset)
-            if stopped:
-                state[book_id] = {"file": idx, "ms": pos_ms}
+        with playback_lock:
+            for idx in range(start_index, len(files)):
+                fpath = files[idx]
+                print(f"   Atskaņoju: {os.path.basename(fpath)}")
+                offset = start_ms if idx == start_index else 0
+                stopped, pos_ms = play_mp3_file(fpath, start_ms=offset)
+                if stopped:
+                    state[book_id] = {"file": idx, "ms": pos_ms}
+                    _save_local_progress(state)
+                    print("   Atskaņošana apturēta (Enter).")
+                    return
+                state[book_id] = {"file": idx + 1, "ms": 0}  # nākamais fails
                 _save_local_progress(state)
-                print("   Atskaņošana apturēta (Enter).")
-                return
-            state[book_id] = {"file": idx + 1, "ms": 0}  # nākamais fails
-            _save_local_progress(state)
     except KeyboardInterrupt:
         print("\n[*] Atskaņošana apturēta.")
         _save_local_progress(state)
@@ -264,6 +325,7 @@ def play_local_book(book_id: str, resume: bool = False):
 
 # Ielādējam kataloga informāciju startā
 refresh_local_books()
+set_scheduled_book_id(_load_scheduled_book_id())
 
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
@@ -309,21 +371,25 @@ def record_audio_to_wav(path: str):
     print("Ieraksts sākts – runā mikrofona virzienā... (Enter vai Space = stop)")
 
     frames = []
+    recording_flag.set()
 
     def callback(indata, frames_count, time_info, status):
         if status:
             print(f"[sounddevice status] {status}", file=sys.stderr)
         frames.append(indata.copy())
 
-    with sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="float32",
-        callback=callback,
-    ):
-        # This keyboard.wait() blocks while callback keeps filling frames
-        _wait_enter_or_space()
-        print("Ieraksts apturēts, apstrādāju...")
+    try:
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            callback=callback,
+        ):
+            # This keyboard.wait() blocks while callback keeps filling frames
+            _wait_enter_or_space()
+            print("Ieraksts apturēts, apstrādāju...")
+    finally:
+        recording_flag.clear()
 
     if not frames:
         print("Netika ierakstīts neviens kadrs.")
@@ -544,9 +610,10 @@ def play_audiobook(book_id: str):
     print("   (Ctrl+C, lai apturētu atskaņošanu un atgrieztos pie asistenta.)")
 
     try:
-        for fpath in files:
-            print(f"   Atskaņoju: {os.path.basename(fpath)}")
-            subprocess.run(["afplay", fpath])
+        with playback_lock:
+            for fpath in files:
+                print(f"   Atskaņoju: {os.path.basename(fpath)}")
+                subprocess.run(["afplay", fpath])
     except KeyboardInterrupt:
         print("\n[*] Audiogrāmata apturēta ar Ctrl+C.")
 
@@ -672,9 +739,10 @@ def play_audio_file(path: str):
 
     remover = _add_temp_enter_hotkey(on_enter)
     try:
-        data, samplerate = sf.read(path, dtype="float32")
-        sd.play(data, samplerate)
-        sd.wait()
+        with playback_lock:
+            data, samplerate = sf.read(path, dtype="float32")
+            sd.play(data, samplerate)
+            sd.wait()
     finally:
         try:
             remover()
@@ -748,6 +816,104 @@ def play_mp3_file(path: str, start_ms: int = 0):
             return False, 0
 
 
+# ===== SCHEDULED UI HELPERS =====
+def _prompt_book_selection(max_items: int = 100) -> Optional[str]:
+    """Interactive prompt to choose a book ID from LOCAL_BOOKS."""
+    refresh_local_books()
+    if not LOCAL_BOOKS:
+        print("Nav atrastas lokālās grāmatas mapē 'Grāmatas'.")
+        return None
+
+    ordered = sorted(LOCAL_BOOKS.items(), key=lambda pair: pair[1]["display"].lower())
+    ordered = ordered[:max_items]
+    print("\nPieejamās grāmatas (1–100):")
+    for idx, (book_id, info) in enumerate(ordered, start=1):
+        marker = "  <-- vakara grāmata" if book_id == SCHEDULED_BOOK_ID else ""
+        print(f"{idx:3d}. {info['display']} (ID: {book_id}){marker}")
+
+    choice = input("Ievadi grāmatas numuru (Enter, lai atceltu): ").strip()
+    if not choice:
+        return None
+    try:
+        num = int(choice)
+    except ValueError:
+        print("Lūdzu ievadi skaitli.")
+        return None
+    if not (1 <= num <= len(ordered)):
+        print("Numurs ārpus saraksta.")
+        return None
+    return ordered[num - 1][0]
+
+
+def _prompt_file_selection(book_id: str, max_items: int = 100):
+    """Let user pick the next file/chapter to use for scheduled reading."""
+    item = LOCAL_BOOKS.get(book_id)
+    if not item:
+        print("Neizdevās atrast izvēlēto grāmatu.")
+        return
+
+    files = sorted(glob.glob(os.path.join(item["path"], "*.mp3")), key=_natural_key)
+    if not files:
+        print("Mapē nav mp3 failu.")
+        return
+
+    max_show = min(len(files), max_items)
+    progress = _get_book_progress(book_id)
+    current_idx = max(0, min(progress.get("file", 0), len(files) - 1))
+
+    print(f"\nFaili grāmatai {item['display']}:")
+    for idx, fpath in enumerate(files[:max_show], start=1):
+        marker = "  <-- nākamais" if idx - 1 == current_idx else ""
+        print(f"{idx:3d}. {os.path.basename(fpath)}{marker}")
+    if len(files) > max_show:
+        print(f"... (parādīti pirmie {max_show} faili no {len(files)})")
+
+    prompt = input(f"Ievadi faila numuru (Enter, lai atstātu #{current_idx + 1}): ").strip()
+    if not prompt:
+        return
+    try:
+        choice = int(prompt)
+    except ValueError:
+        print("Lūdzu ievadi skaitli.")
+        return
+    if not (1 <= choice <= max_show):
+        print("Numurs ārpus parādītā saraksta.")
+        return
+
+    target_idx = choice - 1
+    state = _load_local_progress()
+    state[book_id] = {"file": target_idx, "ms": 0}
+    _save_local_progress(state)
+    print(f"-> Vakara lasījums sāksies no faila #{choice}: {os.path.basename(files[target_idx])}")
+
+
+def run_scheduler_ui():
+    """Simple console UI to view and change the nightly audiobook + file."""
+    print("\n=== Vakara lasījuma iestatījumi ===")
+    while True:
+        print(describe_scheduled_book())
+        print("Komandas: [L] izvēlēties grāmatu  [F] izvēlēties failu  [Q] turpināt")
+        choice = input(">> ").strip().lower()
+        if choice in {"q", "quit", ""}:
+            break
+        if choice in {"l", "book", "g"}:
+            book_id = _prompt_book_selection()
+            if book_id:
+                set_scheduled_book_id(book_id)
+                refresh_local_books()
+                book_name = LOCAL_BOOKS.get(book_id, {}).get("display", book_id)
+                print(f"-> Vakara grāmata iestatīta uz: {book_name}")
+                _prompt_file_selection(book_id)
+            continue
+        if choice in {"f", "file"}:
+            if not SCHEDULED_BOOK_ID:
+                print("Vispirms izvēlies vakara grāmatu.")
+                continue
+            _prompt_file_selection(SCHEDULED_BOOK_ID)
+            continue
+        print("Neatpazīta izvēle.")
+
+
 def log_conversation(user_text: str, reply_text: str, note: Optional[str] = None):
     """Append interaction to a log file for later review."""
     try:
@@ -763,6 +929,108 @@ def log_conversation(user_text: str, reply_text: str, note: Optional[str] = None
             f.write("---\n")
     except Exception as e:
         print(f"[*] Neizdevās ierakstīt žurnālā: {e}")
+
+
+# ===== SCHEDULED ANNOUNCEMENTS =====
+def _speak_scheduled_message(text: str, note: str) -> bool:
+    """TTS helper for scheduler that skips if recording/playback is busy."""
+    if recording_flag.is_set() or playback_lock.locked():
+        return False
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_path = os.path.join(tmpdir, "scheduled.mp3")
+        tts_latvian_to_file(text, out_path)
+        play_audio_file(out_path)
+
+    log_conversation("<<scheduler>>", text, note=note)
+    return True
+
+
+def _play_scheduled_chapter() -> bool:
+    """
+    Play the next chapter (single mp3 file) from SCHEDULED_BOOK_ID at 22:00.
+    Returns True if we handled the trigger (even with an error message), False if deferred.
+    """
+    if recording_flag.is_set() or playback_lock.locked():
+        return False
+
+    if not SCHEDULED_BOOK_ID:
+        _speak_scheduled_message("Ir vakars, 22:00, bet vakara lasījumam nav izvēlēta grāmata.", "sched_evening_missing_book")
+        return True
+
+    refresh_local_books()
+    item = LOCAL_BOOKS.get(SCHEDULED_BOOK_ID)
+    if not item:
+        _speak_scheduled_message("Vakara lasījumam norādītā grāmata nav atrodama. Lūdzu pārbaudi konfigurāciju.", "sched_evening_missing_book")
+        return True
+
+    files = sorted(glob.glob(os.path.join(item["path"], "*.mp3")), key=_natural_key)
+    if not files:
+        _speak_scheduled_message(f"Mapē {item['display']} nav atrasti mp3 faili.", "sched_evening_no_files")
+        return True
+
+    progress = _get_book_progress(SCHEDULED_BOOK_ID)
+    idx = progress.get("file", 0)
+    if idx >= len(files):
+        _speak_scheduled_message(f"Grāmata {item['display']} jau ir pabeigta.", "sched_evening_complete")
+        return True
+    idx = max(0, idx)
+    chapter_path = files[idx]
+
+    def _play():
+        with playback_lock:
+            stopped, pos_ms = play_mp3_file(chapter_path)
+        state = _load_local_progress()
+        if stopped:
+            state[SCHEDULED_BOOK_ID] = {"file": idx, "ms": pos_ms}
+        else:
+            state[SCHEDULED_BOOK_ID] = {"file": min(idx + 1, len(files) - 1), "ms": 0}
+        _save_local_progress(state)
+
+    threading.Thread(target=_play, daemon=True).start()
+    _speak_scheduled_message(f"Tagad lasu vakara nodaļu no {item['display']}.", "sched_evening_start")
+    return True
+
+
+def _scheduler_loop():
+    last_hourly = None  # (yearday, hour)
+    last_weather_day = None
+    last_evening_day = None
+
+    while not scheduler_stop_event.is_set():
+        now = time.localtime()
+
+        # Hourly time announcement between 08:00 and 00:00
+        if ((8 <= now.tm_hour <= 23) or now.tm_hour == 0) and now.tm_min == 0:
+            key = (now.tm_yday, now.tm_hour)
+            if key != last_hourly:
+                if _speak_scheduled_message(get_time_text(), "sched_time"):
+                    last_hourly = key
+
+        # Morning weather around 09:00
+        if now.tm_hour == 9 and now.tm_min == 0 and now.tm_yday != last_weather_day:
+            if _speak_scheduled_message(get_weather_text(DEFAULT_WEATHER_PLACE), "sched_weather"):
+                last_weather_day = now.tm_yday
+
+        # Evening chapter around 22:00 (tolerate first 5 minutes)
+        if now.tm_hour == 22 and now.tm_min < 5 and now.tm_yday != last_evening_day:
+            if _play_scheduled_chapter():
+                last_evening_day = now.tm_yday
+
+        scheduler_stop_event.wait(20)
+
+
+def start_scheduler_thread():
+    global scheduler_thread
+    if scheduler_thread and scheduler_thread.is_alive():
+        return
+    scheduler_stop_event.clear()
+    scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
+    scheduler_thread.start()
+
+
+def stop_scheduler_thread():
+    scheduler_stop_event.set()
 
 
 # ===== THINKING SOUND HELPERS =====
@@ -802,6 +1070,27 @@ def start_thinking_sound():
 
 def stop_thinking_sound():
     thinking_stop_event.set()
+
+
+def maybe_show_scheduler_menu() -> bool:
+    """
+    Offer a simple menu to manage the nightly audiobook before starting voice mode.
+    Returns False if the program should exit after the menu.
+    """
+    if "--schedule-ui-only" in sys.argv:
+        run_scheduler_ui()
+        return False
+
+    if "--schedule-ui" in sys.argv or "--ui" in sys.argv:
+        run_scheduler_ui()
+        return True
+
+    if sys.stdin.isatty():
+        print(describe_scheduled_book())
+        ans = input("Enter - sākt balsi; ieraksti 'menu', lai pārvaldītu vakara lasījumu: ").strip().lower()
+        if ans in {"menu", "m", "1"}:
+            run_scheduler_ui()
+    return True
 
 
 def main_loop():
@@ -910,6 +1199,11 @@ def main_loop():
 
 if __name__ == "__main__":
     try:
+        if not maybe_show_scheduler_menu():
+            sys.exit(0)
+        start_scheduler_thread()
         main_loop()
     except KeyboardInterrupt:
         print("\nIziešana. Uz redzēšanos!")
+    finally:
+        stop_scheduler_thread()
