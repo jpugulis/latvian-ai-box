@@ -447,12 +447,58 @@ def list_youtube_items_for_prompt() -> str:
 
 
 def get_weather_text(place: str = DEFAULT_WEATHER_PLACE) -> str:
-    """Fetch a very short weather summary for the given place using wttr.in.
+    """Fetch a short weather summary.
 
-    This runs on *your* Mac (not inside OpenAI), so it can reach the public
-    internet while the assistant script is running.
+    - For Rīga we use LVĢMC data (punkt: P269) from videscentrs.lvgmc.lv.
+    - Otherwise we fall back to wttr.in one-line summary.
     """
     print("-> Vaicos par laikapstākļiem internetā...")
+
+    def _wind_dir(deg: float) -> str:
+        dirs = ["ziemeļiem", "ziemeļaustrumiem", "austrumiem", "dienvidaustrumiem", "dienvidiem", "dienvidrietumiem", "rietumiem", "ziemeļrietumiem"]
+        idx = int((deg + 22.5) // 45) % 8
+        return dirs[idx]
+
+    if place.lower().startswith("rīga"):
+        try:
+            url = "https://videscentrs.lvgmc.lv/data/weather_forecast_for_location_hourly"
+            resp = requests.get(url, params={"punkts": "P269"}, timeout=6)
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                raise ValueError("empty forecast")
+
+            now = time.strftime("%Y%m%d%H%M", time.localtime())
+            # pick the first forecast at or after current time
+            best = min(data, key=lambda e: (e.get("laiks") < now, abs(int(e.get("laiks", "0")) - int(now))))
+
+            temp = float(best.get("temperatura", 0))
+            wind = float(best.get("veja_atrums", 0))
+            wind_dir = float(best.get("veja_virziens", 0))
+            precip = best.get("nokrisni_1h") or best.get("nokrisni_12h") or "0"
+            pressure = best.get("spiediens")
+            time_str = best.get("laiks", "")[-4:]
+            hhmm = f"{time_str[:2]}:{time_str[2:]}" if len(time_str) == 4 else "drīzumā"
+
+            parts = [
+                f"Laikapstākļi Rīgā ({hhmm} prognoze):",
+                f"temperatūra {temp:+.0f}°C",
+                f"vējš {wind:.1f} m/s no { _wind_dir(wind_dir) }",
+            ]
+            try:
+                precip_val = float(precip)
+                parts.append(f"nokrišņi {precip_val:.1f} mm")
+            except Exception:
+                pass
+            if pressure:
+                try:
+                    parts.append(f"spiediens {float(pressure):.0f} hPa")
+                except Exception:
+                    pass
+            return ", ".join(parts) + "."
+        except Exception as e:
+            print(f"[*] LVĢMC laikapstākļu kļūda: {e}")
+
     try:
         location_string = place.replace(" ", "+")
         url = f"https://wttr.in/{location_string}"
@@ -460,7 +506,6 @@ def get_weather_text(place: str = DEFAULT_WEATHER_PLACE) -> str:
         if resp.status_code != 200:
             return "Neizdevās iegūt laikapstākļu informāciju."
         line = resp.text.strip()
-        # wttr.in already returns a very short one-line summary
         return f"Laikapstākļi vietā {place}: {line}"
     except Exception:
         return "Neizdevās pieslēgties laikapstākļu servisam."
