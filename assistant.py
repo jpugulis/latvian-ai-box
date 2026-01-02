@@ -511,6 +511,34 @@ def get_weather_text(place: str = DEFAULT_WEATHER_PLACE) -> str:
         return "Neizdevās pieslēgties laikapstākļu servisam."
 
 
+def get_text_forecast_latvia() -> str:
+    """Fetch 'Teksta prognoze' from LVĢMC."""
+    try:
+        url = "https://videscentrs.lvgmc.lv/data/sinopt_prognozes"
+        resp = requests.get(url, timeout=6)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data:
+            return "Teksta prognoze pašlaik nav pieejama."
+        entry = data[0]  # API returns latest first
+        text = entry.get("teksti", {}).get("teksts") or entry.get("teksts")
+        date = entry.get("datums")
+        from_time = entry.get("laiks_no")
+        to_time = entry.get("laiks_lidz")
+        if text:
+            prefix = "Teksta prognoze"
+            if date:
+                prefix += f" ({date}"
+                if from_time and to_time:
+                    prefix += f" {from_time}-{to_time}"
+                prefix += ")"
+            return f"{prefix}: {text}"
+        return "Teksta prognoze nav atrasta."
+    except Exception as e:
+        print(f"[*] Teksta prognozes kļūda: {e}")
+        return "Neizdevās iegūt teksta prognozi."
+
+
 def get_time_text() -> str:
     """Return a short Latvian string with the current local time."""
     now = time.localtime()
@@ -937,7 +965,7 @@ def run_scheduler_ui():
     print("\n=== Vakara lasījuma iestatījumi ===")
     while True:
         print(describe_scheduled_book())
-        print("Komandas: [L] izvēlēties grāmatu  [F] izvēlēties failu  [H] pārbaudīt laika paziņojumu  [W] pārbaudīt laikapstākļus Rīgā  [S] sākt vakara lasījumu tagad  [Q] turpināt")
+        print("Komandas: [L] izvēlēties grāmatu  [F] izvēlēties failu  [H] pārbaudīt laika paziņojumu  [W] pārbaudīt laikapstākļus Rīgā  [T] teksta prognoze  [S] sākt vakara lasījumu tagad  [Q] turpināt")
         choice = input(">> ").strip().lower()
         if choice in {"q", "quit", ""}:
             break
@@ -962,6 +990,10 @@ def run_scheduler_ui():
             continue
         if choice in {"w", "weather"}:
             if not _speak_scheduled_message(get_weather_text(RIGA_WEATHER_PLACE), "sched_weather_manual"):
+                print("Paziņojums izlaists — sistēma pašlaik atskaņo/ieraksta.")
+            continue
+        if choice in {"t", "text"}:
+            if not _speak_scheduled_message(get_text_forecast_latvia(), "sched_text_forecast_manual"):
                 print("Paziņojums izlaists — sistēma pašlaik atskaņo/ieraksta.")
             continue
         if choice in {"s", "start", "play"}:
