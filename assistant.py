@@ -9,6 +9,8 @@ import threading
 import time
 import json
 import re
+import random
+import datetime
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -37,6 +39,15 @@ DEFAULT_READING_TIMES = ["23:10"]        # default nightly reading times (HH:MM,
 DEFAULT_FILES_PER_SESSION = 1            # how many mp3 files to play per scheduled run
 SCHEDULED_READING_TIMES = DEFAULT_READING_TIMES.copy()
 SCHEDULED_FILES_PER_SESSION = DEFAULT_FILES_PER_SESSION
+
+# Local sound assets (chimes, Viktors time announcements, riddles)
+SOUNDS_ROOT = os.path.expanduser("~/Desktop/Sounds")
+BEFORE_NOTIFICATION_SOUND = os.path.join(SOUNDS_ROOT, "before-notification.wav")
+SUPPORTED_TIME_MINUTES = [0, 15, 30, 45]
+TIME_ANNOUNCE_MIN_MINUTES = max(1, int(os.getenv("TIME_ANNOUNCE_MIN_MINUTES", "45")))
+TIME_ANNOUNCE_MAX_MINUTES = max(TIME_ANNOUNCE_MIN_MINUTES, int(os.getenv("TIME_ANNOUNCE_MAX_MINUTES", "75")))
+TIME_ANNOUNCE_WINDOW_START = 8  # 08:00
+RIDDLE_STATE_PATH = os.path.join(os.path.dirname(__file__), "state", "riddle_state.json")
 
 # Available TTS voices user can choose from (spoken label -> OpenAI voice name)
 AVAILABLE_VOICES = {
@@ -1129,7 +1140,7 @@ def run_scheduler_ui():
             _prompt_files_per_session()
             continue
         if choice in {"h", "hour", "time"}:
-            if not _speak_scheduled_message(get_time_text(), "sched_time_manual"):
+            if not _play_time_announcement("sched_time_manual", allow_riddle=False):
                 print("Paziņojums izlaists — sistēma pašlaik atskaņo/ieraksta.")
             continue
         if choice in {"w", "weather"}:
@@ -1162,6 +1173,156 @@ def log_conversation(user_text: str, reply_text: str, note: Optional[str] = None
             f.write("---\n")
     except Exception as e:
         print(f"[*] Neizdevās ierakstīt žurnālā: {e}")
+
+
+# ===== TIME/RIDDLE HELPERS =====
+def _ensure_parent_dir(path: str):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception:
+        pass
+
+
+def _within_time_announce_window(now: time.struct_time) -> bool:
+    """Return True if we should allow time announcements at this hour."""
+    return (TIME_ANNOUNCE_WINDOW_START <= now.tm_hour <= 23) or (now.tm_hour == 0)
+
+
+def _next_time_window_start_ts(ref: Optional[time.struct_time] = None) -> float:
+    """Timestamp for the next 08:00 window start."""
+    now_dt = datetime.datetime.now() if ref is None else datetime.datetime.fromtimestamp(time.mktime(ref))
+    start_today = now_dt.replace(hour=TIME_ANNOUNCE_WINDOW_START, minute=0, second=0, microsecond=0)
+    if now_dt < start_today:
+        return start_today.timestamp()
+    return (start_today + datetime.timedelta(days=1)).timestamp()
+
+
+def _random_time_announce_delay_seconds() -> int:
+    return random.randint(TIME_ANNOUNCE_MIN_MINUTES * 60, TIME_ANNOUNCE_MAX_MINUTES * 60)
+
+
+def _round_to_supported_minute(now: time.struct_time) -> tuple[int, int]:
+    """Round current minutes to closest supported minute for Viktors files."""
+    minute = now.tm_min
+    target_minute = min(SUPPORTED_TIME_MINUTES, key=lambda m: (abs(m - minute), m))
+    return now.tm_hour, target_minute
+
+
+def _find_time_audio_file(hour: int, minute: int) -> Optional[str]:
+    """Try to locate prerecorded Viktors time file."""
+    candidates = []
+    for h in (f"{hour}", f"{hour:02d}"):
+        candidates.append(os.path.join(SOUNDS_ROOT, f"Laiks_{h}_{minute:02d}.wav"))
+        candidates.append(os.path.join(SOUNDS_ROOT, f"laiks_{h}_{minute:02d}.wav"))
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+
+    for path in glob.glob(os.path.join(SOUNDS_ROOT, "Laiks_*_*.wav")):
+        base = os.path.basename(path)
+        match = re.match(r"(?i)laiks_(\d{1,2})_(\d{2})\.wav", base)
+        if match and int(match.group(1)) == int(hour) and int(match.group(2)) == int(minute):
+            return path
+    return None
+
+
+def _play_before_notification() -> bool:
+    if not os.path.isfile(BEFORE_NOTIFICATION_SOUND):
+        print(f"[time] Pirms-paziņojuma fails nav atrasts: {BEFORE_NOTIFICATION_SOUND}")
+        return False
+    print(f"[time] Pirms-paziņojuma skaņa: {BEFORE_NOTIFICATION_SOUND}")
+    play_audio_file(BEFORE_NOTIFICATION_SOUND)
+    return True
+
+
+def _load_riddle_state() -> dict:
+    try:
+        with open(RIDDLE_STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_riddle_state(state: dict):
+    try:
+        _ensure_parent_dir(RIDDLE_STATE_PATH)
+        with open(RIDDLE_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[*] Neizdevās saglabāt mīklu stāvokli: {e}")
+
+
+def _maybe_play_daily_riddle(now: time.struct_time):
+    """Play one random riddle per day after a time announcement."""
+    today = time.strftime("%Y-%m-%d", now)
+    now_minutes = now.tm_hour * 60 + now.tm_min
+    state = _load_riddle_state()
+
+    # Determine today's random trigger minute once per day
+    target_day = state.get("target_day")
+    if target_day != today:
+        target_minute = random.randint(TIME_ANNOUNCE_WINDOW_START * 60, 23 * 60 + 59)
+        state["target_day"] = today
+        state["target_minute"] = target_minute
+        _save_riddle_state(state)
+    target_minute = state.get("target_minute")
+
+    if state.get("last_played_date") == today:
+        return
+    if target_minute is None or now_minutes < int(target_minute):
+        return
+
+    riddle_files = glob.glob(os.path.join(SOUNDS_ROOT, "viktors__riddle_*__v*.wav"))
+    if not riddle_files:
+        print("[riddle] Nav atrasti mīklu faili mapē Desktop/Sounds.")
+        return
+
+    chosen = random.choice(riddle_files)
+    print(f"[riddle] Atskaņoju mīklu: {chosen}")
+    play_audio_file(chosen)
+    state["last_played_date"] = today
+    _save_riddle_state(state)
+    log_conversation("<<scheduler>>", f"[Riddle] {os.path.basename(chosen)}", note="riddle_played")
+
+
+def _play_time_announcement(note: str = "sched_time", allow_riddle: bool = True) -> bool:
+    """Play chime + time announcement using Viktors WAV if present, else TTS."""
+    if recording_flag.is_set() or playback_lock.locked():
+        print("[time] Izlaižu laika paziņojumu — sistēma aizņemta.")
+        return False
+
+    now = time.localtime()
+    rounded_hour, rounded_minute = _round_to_supported_minute(now)
+
+    chime_played = _play_before_notification()
+    time_file = _find_time_audio_file(rounded_hour, rounded_minute)
+    used_tts = False
+    rounded_text = f"Šobrīd ir {rounded_hour:02d}:{rounded_minute:02d}."
+
+    if time_file:
+        print(f"[time] Atskaņoju Viktora laika failu: {time_file}")
+        play_audio_file(time_file)
+    else:
+        used_tts = True
+        print("[time] Viktora laika fails nav atrasts, izmantoju TTS.")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = os.path.join(tmpdir, "time.mp3")
+            tts_latvian_to_file(rounded_text, out_path)
+            play_audio_file(out_path)
+
+    log_note = [
+        note,
+        f"rounded={rounded_hour:02d}:{rounded_minute:02d}",
+        f"tts={int(used_tts)}",
+        f"chime={int(chime_played)}",
+    ]
+    if time_file:
+        log_note.append(f"file={os.path.basename(time_file)}")
+    log_conversation("<<scheduler>>", rounded_text, note="|".join(log_note))
+
+    if allow_riddle:
+        _maybe_play_daily_riddle(now)
+    return True
 
 
 # ===== SCHEDULED ANNOUNCEMENTS =====
@@ -1242,21 +1403,35 @@ def _play_scheduled_chapter() -> bool:
 
 
 def _scheduler_loop():
-    last_hourly = None  # (yearday, hour)
     last_weather_day = None
     last_evening_by_time = {}
     last_text_morning_day = None
     last_text_evening_day = None
+    next_time_announce_ts = None
 
     while not scheduler_stop_event.is_set():
         now = time.localtime()
+        now_ts = time.time()
 
-        # Hourly time announcement between 08:00 and 00:00
-        if ((8 <= now.tm_hour <= 23) or now.tm_hour == 0) and now.tm_min == 0:
-            key = (now.tm_yday, now.tm_hour)
-            if key != last_hourly:
-                if _speak_scheduled_message(get_time_text(), "sched_time"):
-                    last_hourly = key
+        # Randomized time announcements between 08:00 and 00:00
+        if next_time_announce_ts is None:
+            if _within_time_announce_window(now):
+                next_time_announce_ts = now_ts + _random_time_announce_delay_seconds()
+            else:
+                next_time_announce_ts = _next_time_window_start_ts(now) + _random_time_announce_delay_seconds()
+
+        if _within_time_announce_window(now) and now_ts >= next_time_announce_ts:
+            if _play_time_announcement("sched_time_random", allow_riddle=True):
+                next_time_announce_ts = now_ts + _random_time_announce_delay_seconds()
+                next_candidate = time.localtime(next_time_announce_ts)
+                if not _within_time_announce_window(next_candidate):
+                    next_time_announce_ts = _next_time_window_start_ts(next_candidate) + _random_time_announce_delay_seconds()
+            else:
+                # Busy (recording/playback) – retry soon
+                next_time_announce_ts = now_ts + 60
+        elif not _within_time_announce_window(now):
+            if next_time_announce_ts <= now_ts:
+                next_time_announce_ts = _next_time_window_start_ts(now) + _random_time_announce_delay_seconds()
 
         # Morning weather around 09:00
         if now.tm_hour == 9 and now.tm_min == 0 and now.tm_yday != last_weather_day:
@@ -1481,6 +1656,10 @@ def main_loop():
 
 if __name__ == "__main__":
     try:
+        if "--test-time-announce" in sys.argv or "test_time_announce" in sys.argv:
+            if not _play_time_announcement("manual_test", allow_riddle=False):
+                print("Laika paziņojums izlaists (sistēma aizņemta).")
+            sys.exit(0)
         if not maybe_show_scheduler_menu():
             sys.exit(0)
         start_scheduler_thread()
