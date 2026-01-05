@@ -41,13 +41,25 @@ SCHEDULED_READING_TIMES = DEFAULT_READING_TIMES.copy()
 SCHEDULED_FILES_PER_SESSION = DEFAULT_FILES_PER_SESSION
 
 # Local sound assets (chimes, Viktors time announcements, riddles)
-SOUNDS_ROOT = os.path.expanduser("~/Desktop/Sounds")
-BEFORE_NOTIFICATION_SOUND = os.path.join(SOUNDS_ROOT, "before-notification.wav")
+SOUND_DIRS = [
+    os.path.expanduser("~/Desktop/Sounds"),
+    os.path.expanduser("~/Desktop/Anna"),
+]
+SOUNDS_ROOT = SOUND_DIRS[0]
+BEFORE_NOTIFICATION_BASENAME = "before-notification.wav"
 SUPPORTED_TIME_MINUTES = [0, 15, 30, 45]
 TIME_ANNOUNCE_MIN_MINUTES = max(1, int(os.getenv("TIME_ANNOUNCE_MIN_MINUTES", "45")))
 TIME_ANNOUNCE_MAX_MINUTES = max(TIME_ANNOUNCE_MIN_MINUTES, int(os.getenv("TIME_ANNOUNCE_MAX_MINUTES", "75")))
 TIME_ANNOUNCE_WINDOW_START = 8  # 08:00
 RIDDLE_STATE_PATH = os.path.join(os.path.dirname(__file__), "state", "riddle_state.json")
+EXTRA_STATE_PATH = os.path.join(os.path.dirname(__file__), "state", "extras_state.json")
+EXTRA_RANDOM_MIN = 2
+EXTRA_RANDOM_MAX = 3
+EXTRA_DAY_START_MINUTE = 10 * 60 + 30  # 10:30
+EXTRA_DAY_END_MINUTE = 21 * 60 + 30    # 21:30
+LABRIT_TARGET_MINUTE = 9 * 60 + 30
+LABRIT_JITTER_MINUTES = 10
+RECORDING_AUTO_STOP_SECONDS = int(os.getenv("RECORDING_AUTO_STOP_SECONDS", "180"))
 
 # Available TTS voices user can choose from (spoken label -> OpenAI voice name)
 AVAILABLE_VOICES = {
@@ -479,11 +491,33 @@ def record_audio_to_wav(path: str):
 
     frames = []
     recording_flag.set()
+    stop_event = threading.Event()
+
+    def _stop_timer():
+        time.sleep(RECORDING_AUTO_STOP_SECONDS)
+        if not stop_event.is_set():
+            print(f"\n[record] Automātiska apturēšana pēc {RECORDING_AUTO_STOP_SECONDS} sekundēm.")
+            stop_event.set()
+            try:
+                sd.stop()
+            except Exception:
+                pass
+
+    def _wait_stop_key():
+        _wait_enter_or_space()
+        stop_event.set()
+        try:
+            sd.stop()
+        except Exception:
+            pass
 
     def callback(indata, frames_count, time_info, status):
         if status:
             print(f"[sounddevice status] {status}", file=sys.stderr)
         frames.append(indata.copy())
+
+    stop_thread = threading.Thread(target=_wait_stop_key, daemon=True)
+    timer_thread = threading.Thread(target=_stop_timer, daemon=True)
 
     try:
         with sd.InputStream(
@@ -492,8 +526,10 @@ def record_audio_to_wav(path: str):
             dtype="float32",
             callback=callback,
         ):
-            # This keyboard.wait() blocks while callback keeps filling frames
-            _wait_enter_or_space()
+            stop_thread.start()
+            timer_thread.start()
+            while not stop_event.is_set():
+                time.sleep(0.05)
             print("Ieraksts apturēts, apstrādāju...")
     finally:
         recording_flag.clear()
@@ -1183,6 +1219,13 @@ def _ensure_parent_dir(path: str):
         pass
 
 
+def _first_existing_path(paths: list[str]) -> Optional[str]:
+    for p in paths:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
 def _within_time_announce_window(now: time.struct_time) -> bool:
     """Return True if we should allow time announcements at this hour."""
     return (TIME_ANNOUNCE_WINDOW_START <= now.tm_hour <= 23) or (now.tm_hour == 0)
@@ -1210,28 +1253,33 @@ def _round_to_supported_minute(now: time.struct_time) -> tuple[int, int]:
 
 def _find_time_audio_file(hour: int, minute: int) -> Optional[str]:
     """Try to locate prerecorded Viktors time file."""
-    candidates = []
-    for h in (f"{hour}", f"{hour:02d}"):
-        candidates.append(os.path.join(SOUNDS_ROOT, f"Laiks_{h}_{minute:02d}.wav"))
-        candidates.append(os.path.join(SOUNDS_ROOT, f"laiks_{h}_{minute:02d}.wav"))
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
+    for root in SOUND_DIRS:
+        candidates = []
+        for h in (f"{hour}", f"{hour:02d}"):
+            candidates.append(os.path.join(root, f"Laiks_{h}_{minute:02d}.wav"))
+            candidates.append(os.path.join(root, f"laiks_{h}_{minute:02d}.wav"))
+            candidates.append(os.path.join(root, f"Laiks_{h}_{minute:02d}.mp3"))
+            candidates.append(os.path.join(root, f"laiks_{h}_{minute:02d}.mp3"))
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
 
-    for path in glob.glob(os.path.join(SOUNDS_ROOT, "Laiks_*_*.wav")):
-        base = os.path.basename(path)
-        match = re.match(r"(?i)laiks_(\d{1,2})_(\d{2})\.wav", base)
-        if match and int(match.group(1)) == int(hour) and int(match.group(2)) == int(minute):
-            return path
+        for path in glob.glob(os.path.join(root, "Laiks_*_*.*")):
+            base = os.path.basename(path)
+            match = re.match(r"(?i)laiks_(\d{1,2})_(\d{2})\.(wav|mp3)$", base)
+            if match and int(match.group(1)) == int(hour) and int(match.group(2)) == int(minute):
+                return path
     return None
 
 
 def _play_before_notification() -> bool:
-    if not os.path.isfile(BEFORE_NOTIFICATION_SOUND):
-        print(f"[time] Pirms-paziņojuma fails nav atrasts: {BEFORE_NOTIFICATION_SOUND}")
+    candidates = [os.path.join(root, BEFORE_NOTIFICATION_BASENAME) for root in SOUND_DIRS]
+    path = _first_existing_path(candidates)
+    if not path:
+        print(f"[time] Pirms-paziņojuma fails nav atrasts nevienā mapē: {candidates}")
         return False
-    print(f"[time] Pirms-paziņojuma skaņa: {BEFORE_NOTIFICATION_SOUND}")
-    play_audio_file(BEFORE_NOTIFICATION_SOUND)
+    print(f"[time] Pirms-paziņojuma skaņa: {path}")
+    play_audio_file(path)
     return True
 
 
@@ -1272,7 +1320,9 @@ def _maybe_play_daily_riddle(now: time.struct_time):
     if target_minute is None or now_minutes < int(target_minute):
         return
 
-    riddle_files = glob.glob(os.path.join(SOUNDS_ROOT, "viktors__riddle_*__v*.wav"))
+    riddle_files: list[str] = []
+    for root in SOUND_DIRS:
+        riddle_files.extend(glob.glob(os.path.join(root, "viktors__riddle_*__v*.wav")))
     if not riddle_files:
         print("[riddle] Nav atrasti mīklu faili mapē Desktop/Sounds.")
         return
@@ -1324,6 +1374,116 @@ def _play_time_announcement(note: str = "sched_time", allow_riddle: bool = True)
         _maybe_play_daily_riddle(now)
     return True
 
+
+def _load_extras_state() -> dict:
+    try:
+        with open(EXTRA_STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_extras_state(state: dict):
+    try:
+        _ensure_parent_dir(EXTRA_STATE_PATH)
+        with open(EXTRA_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[*] Neizdevās saglabāt papildus skaņu stāvokli: {e}")
+
+
+def _available_extra_files(name: str) -> list[str]:
+    files: list[str] = []
+    for root in SOUND_DIRS:
+        files.extend(glob.glob(os.path.join(root, f"{name}.*")))
+    return files
+
+
+def _play_extra(name: str) -> bool:
+    files = _available_extra_files(name)
+    if not files:
+        print(f"[extra] Nav atrasts fails {name}.* nevienā mapē.")
+        return False
+    chosen = random.choice(files)
+    print(f"[extra] Atskaņoju {name}: {chosen}")
+    play_audio_file(chosen)
+    log_conversation("<<scheduler>>", f"[Extra] {name}", note=f"extra|file={os.path.basename(chosen)}")
+    return True
+
+
+def _ensure_extras_schedule(now: time.struct_time, now_ts: float) -> dict:
+    """Create daily schedule for extra sounds."""
+    today = time.strftime("%Y-%m-%d", now)
+    state = _load_extras_state()
+    if state.get("day") == today:
+        return state
+
+    # New day -> schedule extras
+    labrit_minute = LABRIT_TARGET_MINUTE + random.randint(-LABRIT_JITTER_MINUTES, LABRIT_JITTER_MINUTES)
+    labrit_ts = datetime.datetime.combine(
+        datetime.date.fromtimestamp(now_ts),
+        datetime.time(hour=0, minute=0),
+    ) + datetime.timedelta(minutes=labrit_minute)
+    labrit_ts = labrit_ts.timestamp()
+    labrit_played = now_ts > labrit_ts + 3600  # skip if already way past morning
+
+    extras = ["extra_apsesties", "extra_bucinas", "extra_elpa", "extra_koki", "extra_milam", "extra_pleci"]
+    random.shuffle(extras)
+    count = random.randint(EXTRA_RANDOM_MIN, EXTRA_RANDOM_MAX)
+    chosen = extras[:count]
+    events = []
+    for name in chosen:
+        minute = random.randint(EXTRA_DAY_START_MINUTE, EXTRA_DAY_END_MINUTE)
+        evt_ts = datetime.datetime.combine(
+            datetime.date.fromtimestamp(now_ts),
+            datetime.time(hour=0, minute=0),
+        ) + datetime.timedelta(minutes=minute)
+        events.append({"name": name, "ts": evt_ts.timestamp(), "played": False})
+
+    state = {
+        "day": today,
+        "labrit_ts": labrit_ts,
+        "labrit_played": labrit_played,
+        "events": events,
+    }
+    _save_extras_state(state)
+    return state
+
+
+def _process_extras(now: time.struct_time, now_ts: float):
+    if recording_flag.is_set() or playback_lock.locked():
+        return
+
+    state = _ensure_extras_schedule(now, now_ts)
+    changed = False
+
+    # Labrit near 09:30
+    labrit_ts = state.get("labrit_ts")
+    if not state.get("labrit_played") and labrit_ts and now_ts >= labrit_ts:
+        if _play_extra("extra_labrit"):
+            state["labrit_played"] = True
+            changed = True
+        else:
+            state["labrit_played"] = True  # avoid rechecking if file missing
+            changed = True
+
+    # Other random extras
+    for event in state.get("events", []):
+        if event.get("played"):
+            continue
+        evt_ts = event.get("ts")
+        if evt_ts is None:
+            continue
+        if now_ts >= evt_ts:
+            if _play_extra(event.get("name", "extra")):
+                event["played"] = True
+                changed = True
+            else:
+                event["played"] = True  # avoid retrying missing file
+                changed = True
+
+    if changed:
+        _save_extras_state(state)
 
 # ===== SCHEDULED ANNOUNCEMENTS =====
 def _speak_scheduled_message(text: str, note: str) -> bool:
@@ -1432,6 +1592,8 @@ def _scheduler_loop():
         elif not _within_time_announce_window(now):
             if next_time_announce_ts <= now_ts:
                 next_time_announce_ts = _next_time_window_start_ts(now) + _random_time_announce_delay_seconds()
+
+        _process_extras(now, now_ts)
 
         # Morning weather around 09:00
         if now.tm_hour == 9 and now.tm_min == 0 and now.tm_yday != last_weather_day:
