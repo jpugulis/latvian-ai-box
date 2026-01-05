@@ -51,6 +51,7 @@ SUPPORTED_TIME_MINUTES = [0, 15, 30, 45]
 TIME_ANNOUNCE_MIN_MINUTES = max(1, int(os.getenv("TIME_ANNOUNCE_MIN_MINUTES", "45")))
 TIME_ANNOUNCE_MAX_MINUTES = max(TIME_ANNOUNCE_MIN_MINUTES, int(os.getenv("TIME_ANNOUNCE_MAX_MINUTES", "75")))
 TIME_ANNOUNCE_WINDOW_START = 8  # 08:00
+TIME_ANNOUNCE_TOLERANCE_SECONDS = 5  # allowed drift from target minute
 RIDDLE_STATE_PATH = os.path.join(os.path.dirname(__file__), "state", "riddle_state.json")
 EXTRA_STATE_PATH = os.path.join(os.path.dirname(__file__), "state", "extras_state.json")
 EXTRA_RANDOM_MIN = 2
@@ -1244,11 +1245,32 @@ def _random_time_announce_delay_seconds() -> int:
     return random.randint(TIME_ANNOUNCE_MIN_MINUTES * 60, TIME_ANNOUNCE_MAX_MINUTES * 60)
 
 
+def _align_to_next_minute(ts: float) -> float:
+    """Align timestamp to the next whole minute (00 seconds)."""
+    dt = datetime.datetime.fromtimestamp(ts).replace(second=0, microsecond=0)
+    aligned = dt.timestamp()
+    if aligned < ts:
+        aligned += 60
+    return aligned
+
+
 def _round_to_supported_minute(now: time.struct_time) -> tuple[int, int]:
     """Round current minutes to closest supported minute for Viktors files."""
     minute = now.tm_min
     target_minute = min(SUPPORTED_TIME_MINUTES, key=lambda m: (abs(m - minute), m))
     return now.tm_hour, target_minute
+
+
+def _next_time_announce_timestamp(ref_ts: float) -> float:
+    """Pick the next time announcement timestamp aligned to a whole minute."""
+    candidate_ts = ref_ts + _random_time_announce_delay_seconds()
+    candidate_ts = _align_to_next_minute(candidate_ts)
+    if _within_time_announce_window(time.localtime(candidate_ts)):
+        return candidate_ts
+
+    # If the candidate lands outside the allowed window, jump to next window start.
+    start_ts = _next_time_window_start_ts(time.localtime(candidate_ts))
+    return _align_to_next_minute(start_ts + _random_time_announce_delay_seconds())
 
 
 def _find_time_audio_file(hour: int, minute: int) -> Optional[str]:
@@ -1335,19 +1357,19 @@ def _maybe_play_daily_riddle(now: time.struct_time):
     log_conversation("<<scheduler>>", f"[Riddle] {os.path.basename(chosen)}", note="riddle_played")
 
 
-def _play_time_announcement(note: str = "sched_time", allow_riddle: bool = True) -> bool:
+def _play_time_announcement(note: str = "sched_time", allow_riddle: bool = True, target_time: Optional[time.struct_time] = None) -> bool:
     """Play chime + time announcement using Viktors WAV if present, else TTS."""
     if recording_flag.is_set() or playback_lock.locked():
         print("[time] Izlaižu laika paziņojumu — sistēma aizņemta.")
         return False
 
-    now = time.localtime()
-    rounded_hour, rounded_minute = _round_to_supported_minute(now)
+    announce_time = target_time or time.localtime()
+    announce_hour, announce_minute = announce_time.tm_hour, announce_time.tm_min
 
     chime_played = _play_before_notification()
-    time_file = _find_time_audio_file(rounded_hour, rounded_minute)
+    time_file = _find_time_audio_file(announce_hour, announce_minute)
     used_tts = False
-    rounded_text = f"Šobrīd ir {rounded_hour:02d}:{rounded_minute:02d}."
+    announce_text = f"Šobrīd ir {announce_hour:02d}:{announce_minute:02d}."
 
     if time_file:
         print(f"[time] Atskaņoju Viktora laika failu: {time_file}")
@@ -1357,21 +1379,21 @@ def _play_time_announcement(note: str = "sched_time", allow_riddle: bool = True)
         print("[time] Viktora laika fails nav atrasts, izmantoju TTS.")
         with tempfile.TemporaryDirectory() as tmpdir:
             out_path = os.path.join(tmpdir, "time.mp3")
-            tts_latvian_to_file(rounded_text, out_path)
+            tts_latvian_to_file(announce_text, out_path)
             play_audio_file(out_path)
 
     log_note = [
         note,
-        f"rounded={rounded_hour:02d}:{rounded_minute:02d}",
+        f"time={announce_hour:02d}:{announce_minute:02d}",
         f"tts={int(used_tts)}",
         f"chime={int(chime_played)}",
     ]
     if time_file:
         log_note.append(f"file={os.path.basename(time_file)}")
-    log_conversation("<<scheduler>>", rounded_text, note="|".join(log_note))
+    log_conversation("<<scheduler>>", announce_text, note="|".join(log_note))
 
     if allow_riddle:
-        _maybe_play_daily_riddle(now)
+        _maybe_play_daily_riddle(time.localtime())
     return True
 
 
@@ -1573,25 +1595,21 @@ def _scheduler_loop():
         now = time.localtime()
         now_ts = time.time()
 
-        # Randomized time announcements between 08:00 and 00:00
+        # Randomized time announcements between 08:00 and 00:00 (precise to the minute)
         if next_time_announce_ts is None:
-            if _within_time_announce_window(now):
-                next_time_announce_ts = now_ts + _random_time_announce_delay_seconds()
-            else:
-                next_time_announce_ts = _next_time_window_start_ts(now) + _random_time_announce_delay_seconds()
+            base_ts = now_ts if _within_time_announce_window(now) else _next_time_window_start_ts(now)
+            next_time_announce_ts = _next_time_announce_timestamp(base_ts)
 
-        if _within_time_announce_window(now) and now_ts >= next_time_announce_ts:
-            if _play_time_announcement("sched_time_random", allow_riddle=True):
-                next_time_announce_ts = now_ts + _random_time_announce_delay_seconds()
-                next_candidate = time.localtime(next_time_announce_ts)
-                if not _within_time_announce_window(next_candidate):
-                    next_time_announce_ts = _next_time_window_start_ts(next_candidate) + _random_time_announce_delay_seconds()
+        target_struct = time.localtime(next_time_announce_ts)
+        if not _within_time_announce_window(target_struct):
+            next_time_announce_ts = _next_time_announce_timestamp(_next_time_window_start_ts(now))
+        elif now_ts >= next_time_announce_ts:
+            drift = abs(now_ts - next_time_announce_ts)
+            if drift <= TIME_ANNOUNCE_TOLERANCE_SECONDS and _play_time_announcement("sched_time_random", allow_riddle=True, target_time=target_struct):
+                next_time_announce_ts = _next_time_announce_timestamp(next_time_announce_ts)
             else:
-                # Busy (recording/playback) – retry soon
-                next_time_announce_ts = now_ts + 60
-        elif not _within_time_announce_window(now):
-            if next_time_announce_ts <= now_ts:
-                next_time_announce_ts = _next_time_window_start_ts(now) + _random_time_announce_delay_seconds()
+                # Missed slot or system busy – pick a new target from current time
+                next_time_announce_ts = _next_time_announce_timestamp(now_ts)
 
         _process_extras(now, now_ts)
 
@@ -1622,7 +1640,11 @@ def _scheduler_loop():
                     if _play_scheduled_chapter():
                         last_evening_by_time[parsed] = now.tm_yday
 
-        scheduler_stop_event.wait(20)
+        wait_for = 5.0
+        if next_time_announce_ts:
+            until_next = next_time_announce_ts - time.time()
+            wait_for = max(1.0, min(5.0, until_next))
+        scheduler_stop_event.wait(wait_for)
 
 
 def start_scheduler_thread():
